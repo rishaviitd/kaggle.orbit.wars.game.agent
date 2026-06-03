@@ -1,0 +1,33 @@
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Mac OS
+.DS_Store
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Data & Notebooks
+data/
+*.parquet
+*.csv
+*.json
+*.ipynb
+
+# Kaggle Temporary Orchestrator Directories
+kaggle_runner_tmp_*/
+kaggle_jobs_tmp_*/
