@@ -26,6 +26,7 @@ data/
 *.parquet
 *.csv
 *.json
+!kaggle_jobs/replay_minify/kernel-metadata.json
 *.ipynb
 
 # Kaggle Temporary Orchestrator Directories

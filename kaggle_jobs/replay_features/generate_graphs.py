@@ -173,45 +173,27 @@ def source_target_path_distance(source: dict[str, Any], target: dict[str, Any]) 
 # ============================================================
 # STEP 4: Node Feature Extraction
 # ============================================================
-def extract_node_features_step_4(row, expert_player_id):
+def extract_node_features_step_4(row, expert_player_id, planet_dicts=None, initial_planet_dicts=None):
     """
     Step 4: Extract Strategic Features + Physics + Core Features
     """
     planets_array = row['planets']
     initial_planets_array = row['initial_planets']
-    fleets_array = row['fleets']
-    angular_velocity = float(row['angular_velocity'])
-    step = int(row['step'])
     comet_ids = set(row['comet_planet_ids']) if 'comet_planet_ids' in row else set()
 
     # Build dictionaries for utils
     initial_by_id = {int(p[0]): p for p in initial_planets_array}
     
-    # Parse utils objects
-    target_planets = []
-    planet_dicts = []
-    for p in planets_array:
-        p_dict = planet_from_row(p)
-        planet_dicts.append(p_dict)
-        target_planets.append(Planet(
-            int(p[0]), int(p[1]), float(p[2]), float(p[3]), 
-            float(p[4]), int(p[5]), int(p[6])
-        ))
-        
-    # Parse Fleets
-    utils_fleets = []
-    for f in fleets_array:
-        if len(f) >= 7:
-            utils_fleets.append(Fleet(
-                int(f[0]), int(f[1]), float(f[2]), float(f[3]), 
-                float(f[4]), float(f[5]), int(f[6])
-            ))
+    if planet_dicts is None:
+        planet_dicts = [planet_from_row(p) for p in planets_array]
+    if initial_planet_dicts is None:
+        initial_planet_dicts = [planet_from_row(p) for p in initial_planets_array]
             
     # Global incoming physics simulation removed to speed up extraction.
     # The GNN will learn threats from the temporal fleet edge buckets instead.
 
     # Calculate Quadrant centers for Frontier Role Scoring
-    home_q = home_quadrant(expert_player_id, planet_dicts, [planet_from_row(p) for p in initial_planets_array])
+    home_q = home_quadrant(expert_player_id, planet_dicts, initial_planet_dicts)
     if home_q is not None:
         home_center = quadrant_center(home_q)
         enemy_center = quadrant_center(opposite_quadrant(home_q))
@@ -257,7 +239,7 @@ def extract_node_features_step_4(row, expert_player_id):
 # ============================================================
 # STEP 6: Edge Feature Extraction
 # ============================================================
-def extract_edge_features_step_6(row, expert_player_id):
+def extract_edge_features_step_6(row, expert_player_id, planet_dicts=None):
     """
     Step 6: Extract Base Edge Features + Temporal Fleet Buckets
     Creates a fully connected directed graph (excluding self-loops).
@@ -266,7 +248,8 @@ def extract_edge_features_step_6(row, expert_player_id):
     planets_array = row['planets']
     fleets_array = row['fleets']
     
-    planet_dicts = [planet_from_row(p) for p in planets_array]
+    if planet_dicts is None:
+        planet_dicts = [planet_from_row(p) for p in planets_array]
     num_planets = len(planet_dicts)
     
     all_player_ids = {0, 1, 2, 3}
@@ -288,67 +271,45 @@ def extract_edge_features_step_6(row, expert_player_id):
         edge_key = (s_id, t_id)
         if edge_key not in edge_fleets:
             edge_fleets[edge_key] = []
-        edge_fleets[edge_key].append({
-            'owner': f_owner,
-            'ships': f_ships,
-            'x': f_x,
-            'y': f_y
-        })
+        edge_fleets[edge_key].append((f_owner, f_ships, f_x, f_y))
     
-    edge_index = []
-    edge_features = []
+    edge_index_t, edge_pairs = get_full_directed_edge_template(num_planets)
+    edge_features = np.zeros((len(edge_pairs), 42), dtype=np.float64)
     
     baseline_speed = fleet_speed(1, MAX_SPEED)
     
-    for i in range(num_planets):
-        for j in range(num_planets):
-            if i == j:
-                continue # No self-loops
-                
-            source = planet_dicts[i]
-            target = planet_dicts[j]
-            s_id = source['id']
-            t_id = target['id']
+    for edge_idx, (i, j) in enumerate(edge_pairs):
+        source = planet_dicts[i]
+        target = planet_dicts[j]
+        s_id = source['id']
+        t_id = target['id']
+        
+        # 1. Spatial Features
+        path_distance = source_target_path_distance(source, target)
+        travel_turns = math.ceil(path_distance / baseline_speed)
+        
+        edge_features[edge_idx, 0] = path_distance / 100.0
+        edge_features[edge_idx, 1] = travel_turns / 100.0
+        
+        for owner, fleet_ships, fleet_x, fleet_y in edge_fleets.get((s_id, t_id), ()):
+            # Calculate ETA
+            dist_to_target = math.hypot(target['x'] - fleet_x, target['y'] - fleet_y) - target['radius']
+            dist_to_target = max(0.0, dist_to_target)
+            speed = fleet_speed(fleet_ships, MAX_SPEED)
+            eta = math.ceil(dist_to_target / speed)
             
-            # 1. Spatial Features
-            path_distance = source_target_path_distance(source, target)
-            travel_turns = math.ceil(path_distance / baseline_speed)
+            bucket_idx = min(9, int(eta // 5))
             
-            norm_dist = path_distance / 100.0
-            norm_turns = travel_turns / 100.0
-            
-            # 2. Temporal Fleet Buckets (10 Dims of width 5)
-            my_buckets = [0.0] * 10
-            e1_buckets = [0.0] * 10
-            e2_buckets = [0.0] * 10
-            e3_buckets = [0.0] * 10
-            
-            if (s_id, t_id) in edge_fleets:
-                for active_fleet in edge_fleets[(s_id, t_id)]:
-                    # Calculate ETA
-                    dist_to_target = math.hypot(target['x'] - active_fleet['x'], target['y'] - active_fleet['y']) - target['radius']
-                    dist_to_target = max(0.0, dist_to_target)
-                    speed = fleet_speed(active_fleet['ships'], MAX_SPEED)
-                    eta = math.ceil(dist_to_target / speed)
-                    
-                    bucket_idx = min(9, int(eta // 5))
-                    
-                    norm_ships = active_fleet['ships'] / 100.0
-                    owner = active_fleet['owner']
-                    if owner == expert_player_id:
-                        my_buckets[bucket_idx] += norm_ships
-                    elif owner == e1:
-                        e1_buckets[bucket_idx] += norm_ships
-                    elif owner == e2:
-                        e2_buckets[bucket_idx] += norm_ships
-                    elif owner == e3:
-                        e3_buckets[bucket_idx] += norm_ships
-            
-            edge_feature = [norm_dist, norm_turns] + my_buckets + e1_buckets + e2_buckets + e3_buckets
-            edge_index.append([i, j])
-            edge_features.append(edge_feature)
+            norm_ships = fleet_ships / 100.0
+            if owner == expert_player_id:
+                edge_features[edge_idx, 2 + bucket_idx] += norm_ships
+            elif owner == e1:
+                edge_features[edge_idx, 12 + bucket_idx] += norm_ships
+            elif owner == e2:
+                edge_features[edge_idx, 22 + bucket_idx] += norm_ships
+            elif owner == e3:
+                edge_features[edge_idx, 32 + bucket_idx] += norm_ships
     
-    edge_index_t = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
     edge_attr = torch.tensor(edge_features, dtype=torch.float32)
     
     return edge_index_t, edge_attr
@@ -394,9 +355,20 @@ def generate_pyg_data(row_dict):
     Main function: Takes a single row dict and returns a PyG Data object.
     """
     expert_player_id = int(row_dict.get('expert_player_id', 0))
+    planet_dicts = [planet_from_row(p) for p in row_dict['planets']]
+    initial_planet_dicts = [planet_from_row(p) for p in row_dict['initial_planets']]
     
-    node_features = extract_node_features_step_4(row_dict, expert_player_id)
-    edge_index, edge_attr = extract_edge_features_step_6(row_dict, expert_player_id)
+    node_features = extract_node_features_step_4(
+        row_dict,
+        expert_player_id,
+        planet_dicts=planet_dicts,
+        initial_planet_dicts=initial_planet_dicts,
+    )
+    edge_index, edge_attr = extract_edge_features_step_6(
+        row_dict,
+        expert_player_id,
+        planet_dicts=planet_dicts,
+    )
     y_intent, y_fraction = extract_labels_step_7(row_dict, expert_player_id)
     
     x = torch.tensor(node_features, dtype=torch.float32)
@@ -416,6 +388,21 @@ def generate_pyg_data(row_dict):
 # ============================================================
 import glob
 import time
+import gc
+
+_EDGE_INDEX_CACHE = {}
+_EDGE_PAIR_CACHE = {}
+
+def get_full_directed_edge_template(num_planets):
+    cached = _EDGE_INDEX_CACHE.get(num_planets)
+    if cached is not None:
+        return cached, _EDGE_PAIR_CACHE[num_planets]
+
+    edge_pairs = [(i, j) for i in range(num_planets) for j in range(num_planets) if i != j]
+    edge_index = torch.tensor(edge_pairs, dtype=torch.long).t().contiguous()
+    _EDGE_INDEX_CACHE[num_planets] = edge_index
+    _EDGE_PAIR_CACHE[num_planets] = edge_pairs
+    return edge_index, edge_pairs
 
 def process_row_task(row_dict):
     try:
@@ -423,17 +410,142 @@ def process_row_task(row_dict):
     except Exception as e:
         return None
 
+def pack_graphs(graphs):
+    """
+    Store graph tensors compactly while preserving the same training data.
+    Graphs are grouped by node count so each tensor stack has fixed shapes.
+    Edge features are split into dense spatial columns and sparse fleet buckets.
+    """
+    groups = {}
+    for original_idx, graph in enumerate(graphs):
+        num_nodes = int(graph.x.size(0))
+        group = groups.setdefault(num_nodes, {
+            "indices": [],
+            "edge_index": graph.edge_index,
+            "x": [],
+            "edge_static": [],
+            "edge_bucket_indices": [],
+            "edge_bucket_values": [],
+            "y_intent": [],
+            "y_fraction": [],
+        })
+        edge_buckets = graph.edge_attr[:, 2:]
+        bucket_indices = torch.nonzero(edge_buckets, as_tuple=False)
+        if bucket_indices.numel() > 0:
+            graph_col = torch.full((bucket_indices.size(0), 1), len(group["indices"]), dtype=torch.long)
+            group["edge_bucket_indices"].append(torch.cat([graph_col, bucket_indices], dim=1))
+            group["edge_bucket_values"].append(edge_buckets[bucket_indices[:, 0], bucket_indices[:, 1]])
+
+        group["indices"].append(original_idx)
+        group["x"].append(graph.x)
+        group["edge_static"].append(graph.edge_attr[:, :2])
+        group["y_intent"].append(graph.y_intent)
+        group["y_fraction"].append(graph.y_fraction)
+
+    packed_groups = {}
+    for num_nodes, group in groups.items():
+        key = str(num_nodes)
+        if group["edge_bucket_indices"]:
+            edge_bucket_indices = torch.cat(group["edge_bucket_indices"], dim=0).to(torch.int32)
+            edge_bucket_values = torch.cat(group["edge_bucket_values"], dim=0)
+        else:
+            edge_bucket_indices = torch.empty((0, 3), dtype=torch.int32)
+            edge_bucket_values = torch.empty((0,), dtype=torch.float32)
+
+        packed_groups[key] = {
+            "indices": torch.tensor(group["indices"], dtype=torch.long),
+            "edge_index": group["edge_index"],
+            "x": torch.stack(group["x"], dim=0),
+            "edge_static": torch.stack(group["edge_static"], dim=0),
+            "edge_bucket_indices": edge_bucket_indices,
+            "edge_bucket_values": edge_bucket_values,
+            "y_intent": torch.stack(group["y_intent"], dim=0),
+            "y_fraction": torch.stack(group["y_fraction"], dim=0),
+        }
+
+    return {
+        "format": "packed_pyg_graphs_v2",
+        "num_graphs": len(graphs),
+        "edge_attr_layout": {
+            "static_cols": 2,
+            "bucket_cols": 40,
+            "total_cols": 42,
+        },
+        "groups": packed_groups,
+    }
+
+def unpack_packed_graphs(payload):
+    """
+    Convert a packed chunk back into a list of PyG Data objects.
+    This is useful for future training code that wants the old format.
+    """
+    if isinstance(payload, list):
+        return payload
+    if not isinstance(payload, dict) or payload.get("format") not in {"packed_pyg_graphs_v1", "packed_pyg_graphs_v2"}:
+        raise ValueError("Unsupported graph payload format")
+
+    graphs = [None] * int(payload["num_graphs"])
+    for group in payload["groups"].values():
+        indices = group["indices"].tolist()
+        if "edge_attr" in group:
+            edge_attr = group["edge_attr"]
+        else:
+            edge_attr = torch.zeros(
+                (
+                    group["x"].size(0),
+                    group["edge_static"].size(1),
+                    payload["edge_attr_layout"]["total_cols"],
+                ),
+                dtype=group["edge_static"].dtype,
+            )
+            edge_attr[:, :, :2] = group["edge_static"]
+            bucket_indices = group["edge_bucket_indices"].long()
+            if bucket_indices.numel() > 0:
+                edge_attr[
+                    bucket_indices[:, 0],
+                    bucket_indices[:, 1],
+                    bucket_indices[:, 2] + 2,
+                ] = group["edge_bucket_values"]
+
+        for local_idx, original_idx in enumerate(indices):
+            graphs[original_idx] = Data(
+                x=group["x"][local_idx],
+                edge_index=group["edge_index"],
+                edge_attr=edge_attr[local_idx],
+                y_intent=group["y_intent"][local_idx],
+                y_fraction=group["y_fraction"][local_idx],
+            )
+    return graphs
+
+def env_int(name, default):
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+def process_chunk_rows(chunk_rows, pool, pool_chunksize):
+    if pool is None:
+        return [process_row_task(row) for row in chunk_rows]
+    return pool.map(process_row_task, chunk_rows, chunksize=pool_chunksize)
+
+def find_batch_files(input_dir):
+    patterns = ("batch_*.parquet", "batch-*.parquet")
+    files = []
+    for pattern in patterns:
+        files.extend(glob.glob(f"{input_dir}/**/{pattern}", recursive=True))
+    return sorted(set(files))
+
 def process_kaggle_batches(input_dir="/kaggle/input/notebooks/atomstack001/orbit-parquet-extractor-p1", output_dir="/kaggle/working/pyg_chunks", local_mode=False):
     # Override for local testing if running locally
     if local_mode:
-        input_dir = "data/batch"
+        input_dir = "data"
         output_dir = "data/pyg_chunks"
     
     print(f"=== KAGGLE PIPELINE ===")
     print(f"Input : {input_dir}")
     print(f"Output: {output_dir}")
     
-    batch_files = sorted(glob.glob(f"{input_dir}/**/batch_*.parquet", recursive=True))
+    batch_files = find_batch_files(input_dir)
     
     if not batch_files:
         print("No batch files found! Please check the input path.")
@@ -444,35 +556,64 @@ def process_kaggle_batches(input_dir="/kaggle/input/notebooks/atomstack001/orbit
     
     total_batches = len(batch_files)
     import multiprocessing
-    num_cores = min(4, max(1, multiprocessing.cpu_count()))
+    num_cores = min(env_int("PYG_NUM_CORES", 4), max(1, multiprocessing.cpu_count()))
+    chunk_size = env_int("PYG_CHUNK_SIZE", 5000)
+    pool_chunksize = env_int("PYG_POOL_CHUNKSIZE", 128)
     print(f"Using {num_cores} CPU cores for parallel extraction.")
+    print(f"Chunk size: {chunk_size}; pool chunksize: {pool_chunksize}.")
+    print("Output format: packed_pyg_graphs_v2.")
     global_start = time.time()
+
+    pool = None
+    if num_cores > 1:
+        pool = multiprocessing.Pool(processes=num_cores, maxtasksperchild=10000)
     
-    with multiprocessing.Pool(processes=num_cores) as pool:
+    try:
         for idx, file in enumerate(batch_files):
+            rel_path = os.path.relpath(file, input_dir)
+            rel_parent = os.path.dirname(rel_path)
             file_name = os.path.basename(file).replace('.parquet', '')
-            print(f"\n[{idx + 1}/{total_batches}] Processing {file_name}...")
+            print(f"\n[{idx + 1}/{total_batches}] Processing {rel_path}...")
             
             df = pd.read_parquet(file)
-            rows = df.to_dict('records')
             
-            CHUNK_SIZE = 5000
-            for chunk_idx in range(0, len(rows), CHUNK_SIZE):
-                chunk_rows = rows[chunk_idx:chunk_idx+CHUNK_SIZE]
+            total_rows = len(df)
+            for chunk_idx in range(0, total_rows, chunk_size):
+                chunk_df = df.iloc[chunk_idx:chunk_idx+chunk_size]
+                chunk_rows = chunk_df.to_dict('records')
                 
                 chunk_start = time.time()
-                graphs = pool.map(process_row_task, chunk_rows)
+                graphs = process_chunk_rows(chunk_rows, pool, pool_chunksize)
                 valid_graphs = [g for g in graphs if g is not None]
                 
-                chunk_id = chunk_idx // CHUNK_SIZE
-                out_file = os.path.join(output_dir, f"{file_name}_chunk_{chunk_id}.pt")
-                torch.save(valid_graphs, out_file)
+                chunk_id = chunk_idx // chunk_size
+                chunk_output_dir = os.path.join(output_dir, rel_parent)
+                os.makedirs(chunk_output_dir, exist_ok=True)
+                out_file = os.path.join(chunk_output_dir, f"{file_name}_chunk_{chunk_id}.pt")
+                tmp_file = f"{out_file}.tmp"
+                payload = pack_graphs(valid_graphs)
+                try:
+                    torch.save(payload, tmp_file)
+                    os.replace(tmp_file, out_file)
+                except Exception:
+                    if os.path.exists(tmp_file):
+                        os.remove(tmp_file)
+                    raise
                 
                 elapsed = time.time() - chunk_start
                 rps = len(chunk_rows) / elapsed
-                print(f"  -> Saved {len(valid_graphs)} graphs to {out_file} ({rps:.2f} rows/s)")
+                print(f"  -> Saved {len(valid_graphs)} graphs to {out_file} (packed, {rps:.2f} rows/s)")
+
+                del graphs, valid_graphs, payload, chunk_rows, chunk_df
+                gc.collect()
                 
-            print(f"\u2705 Completed {file_name} ({idx + 1}/{total_batches})")
+            print(f"\u2705 Completed {rel_path} ({idx + 1}/{total_batches})")
+            del df
+            gc.collect()
+    finally:
+        if pool is not None:
+            pool.close()
+            pool.join()
 
     print(f"\n\u2705 All batches processed successfully in {(time.time()-global_start)/60:.2f} minutes!")
 
