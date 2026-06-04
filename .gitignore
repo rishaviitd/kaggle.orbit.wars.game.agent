@@ -25,6 +25,7 @@ __pycache__/
 data/
 *.parquet
 *.csv
+!kaggle_jobs/replay_minify/orbit_wars_current_leaderboard.csv
 *.json
 !kaggle_jobs/replay_minify/kernel-metadata.json
 *.ipynb

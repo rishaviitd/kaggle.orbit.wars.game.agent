@@ -19,12 +19,6 @@ def env_int(name, default):
     except (TypeError, ValueError):
         return default
 
-def env_bool(name, default):
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
-
 def date_key_from_path(json_path):
     match = re.search(r"(20\d{2}-\d{2}-\d{2})", str(json_path))
     return match.group(1) if match else "unknown-date"
@@ -51,7 +45,12 @@ def process_single_replay(json_path):
             return date_key, []
             
         winner_idx = max(range(len(final_rewards)), key=lambda i: final_rewards[i] if final_rewards[i] is not None else -1)
-        
+        info = replay.get('info', {})
+        team_names = info.get('TeamNames') or [
+            agent.get('Name') for agent in info.get('Agents', [])
+        ]
+        statuses = replay.get('statuses', [])
+        seed = info.get('seed')
         flat_steps = []
         game_id = Path(json_path).stem
         
@@ -65,21 +64,27 @@ def process_single_replay(json_path):
             expert_player_id = obs.get('player')
             
             row = {
+                'game_id': game_id,
+                'date': date_key,
+                'step': step_idx,
+                'player_count': len(final_rewards),
+                'winner_idx': winner_idx,
+                'team_names': team_names,
+                'final_rewards': final_rewards,
+                'statuses': statuses,
+                'seed': seed,
                 'expert_player_id': expert_player_id,
+                'player': expert_player_id,
                 'planets': obs.get('planets', []),
                 'initial_planets': obs.get('initial_planets', []),
                 'fleets': obs.get('fleets', []),
+                'angular_velocity': obs.get('angular_velocity', 0.0),
                 'comet_planet_ids': obs.get('comet_planet_ids', []),
-                'action': action 
+                'comets': obs.get('comets', []),
+                'next_fleet_id': obs.get('next_fleet_id'),
+                'remaining_overage_time': obs.get('remainingOverageTime'),
+                'action': action,
             }
-            if env_bool("MINIFY_KEEP_DEBUG_COLUMNS", False):
-                row.update({
-                    'game_id': game_id,
-                    'step': step_idx,
-                    'player': expert_player_id,
-                    'angular_velocity': obs.get('angular_velocity', 0.0),
-                    'comets': obs.get('comets', []),
-                })
 
             flat_steps.append(row)
             
@@ -140,7 +145,6 @@ if __name__ == '__main__':
     max_workers = min(env_int("MINIFY_NUM_WORKERS", 4), os.cpu_count() or 4)
     batch_size = env_int("MINIFY_GAMES_PER_PARQUET", 1000)
     executor_chunksize = env_int("MINIFY_EXECUTOR_CHUNKSIZE", 10)
-    keep_debug_columns = env_bool("MINIFY_KEEP_DEBUG_COLUMNS", False)
     
     current_batch_data = []
     current_date = None
@@ -152,7 +156,6 @@ if __name__ == '__main__':
     print(f"Starting Parquet batch processing with {max_workers} workers...")
     print(f"Games per parquet: {batch_size}")
     print(f"Executor chunksize: {executor_chunksize}")
-    print(f"Keep debug columns: {keep_debug_columns}")
     
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         # Use executor.map to stream results instead of storing 31,000 Future objects in RAM

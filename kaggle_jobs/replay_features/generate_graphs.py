@@ -535,7 +535,7 @@ def find_batch_files(input_dir):
         files.extend(glob.glob(f"{input_dir}/**/{pattern}", recursive=True))
     return sorted(set(files))
 
-def process_kaggle_batches(input_dir="/kaggle/input/notebooks/atomstack001/orbit-parquet-extractor-p1", output_dir="/kaggle/working/pyg_chunks", local_mode=False):
+def process_kaggle_batches(input_dir="/kaggle/input/minified-replay-data-p1", output_dir="/kaggle/working/pyg_chunks", local_mode=False):
     # Override for local testing if running locally
     if local_mode:
         input_dir = "data"
@@ -559,8 +559,16 @@ def process_kaggle_batches(input_dir="/kaggle/input/notebooks/atomstack001/orbit
     num_cores = min(env_int("PYG_NUM_CORES", 4), max(1, multiprocessing.cpu_count()))
     chunk_size = env_int("PYG_CHUNK_SIZE", 5000)
     pool_chunksize = env_int("PYG_POOL_CHUNKSIZE", 128)
+    start_batch_index = max(1, env_int("PYG_START_BATCH_INDEX", 1))
+    end_batch_index = env_int("PYG_END_BATCH_INDEX", total_batches)
+    if end_batch_index < start_batch_index:
+        print(f"No batches selected: start={start_batch_index}, end={end_batch_index}.")
+        return
+    batch_files = batch_files[start_batch_index - 1:end_batch_index]
+    selected_total_batches = len(batch_files)
     print(f"Using {num_cores} CPU cores for parallel extraction.")
     print(f"Chunk size: {chunk_size}; pool chunksize: {pool_chunksize}.")
+    print(f"Selected parquet batch files: {start_batch_index}-{end_batch_index} of {total_batches} ({selected_total_batches} files).")
     print("Output format: packed_pyg_graphs_v2.")
     global_start = time.time()
 
@@ -570,10 +578,11 @@ def process_kaggle_batches(input_dir="/kaggle/input/notebooks/atomstack001/orbit
     
     try:
         for idx, file in enumerate(batch_files):
+            absolute_batch_index = start_batch_index + idx
             rel_path = os.path.relpath(file, input_dir)
             rel_parent = os.path.dirname(rel_path)
             file_name = os.path.basename(file).replace('.parquet', '')
-            print(f"\n[{idx + 1}/{total_batches}] Processing {rel_path}...")
+            print(f"\n[{absolute_batch_index}/{total_batches}] Processing {rel_path}...")
             
             df = pd.read_parquet(file)
             
@@ -607,7 +616,7 @@ def process_kaggle_batches(input_dir="/kaggle/input/notebooks/atomstack001/orbit
                 del graphs, valid_graphs, payload, chunk_rows, chunk_df
                 gc.collect()
                 
-            print(f"\u2705 Completed {rel_path} ({idx + 1}/{total_batches})")
+            print(f"\u2705 Completed {rel_path} ({absolute_batch_index}/{total_batches})")
             del df
             gc.collect()
     finally:
