@@ -135,10 +135,8 @@ class HumanOrbitGame:
         self.reset(agent_key=agent_key, human_player=human_player, seed=seed, episode_steps=episode_steps)
 
     def agent_path(self, agent_key: str) -> Path:
-        if agent_key in ("improved_v0", "opening_improved_v0"):
-            return ROOT / "agents" / "opening_agent_improved_v0.py"
-        if agent_key in ("improved", "opening_improved", "improved_v1", "opening_improved_v1"):
-            return ROOT / "agents" / "opening_agent_improved_v1.py"
+        if agent_key == "v0":
+            return ROOT / "agents" / "v0.py"
         path = Path(agent_key)
         return path if path.is_absolute() else ROOT / path
 
@@ -1320,8 +1318,7 @@ HTML = r"""<!doctype html>
         <summary>Options</summary>
         <div class="settings">
           <select id="agentSelect">
-            <option value="opening_improved_v1">opening improved v1</option>
-            <option value="opening_improved_v0">opening improved v0</option>
+            <option value="v0">v0</option>
           </select>
           <button id="saveBtn">Save Episode</button>
           <button id="clearQueueBtn">Clear Queue</button>
@@ -2278,8 +2275,7 @@ HTML = r"""<!doctype html>
       document.getElementById('humanProd').textContent = shipTotal(humanPlayer());
       document.getElementById('agentProd').textContent = shipTotal(agentPlayer());
       document.getElementById('agentName').textContent =
-        ['improved_v0', 'opening_improved_v0'].includes(state?.agent) || String(state?.agent || '').includes('opening_agent_improved_v0') ? 'V0' :
-        ['improved', 'opening_improved', 'improved_v1', 'opening_improved_v1'].includes(state?.agent) || String(state?.agent || '').includes('opening_agent_improved_v1') ? 'V1' :
+        state?.agent === 'v0' || String(state?.agent || '').endsWith('/agents/v0.py') ? 'V0' :
         'Improved';
       document.getElementById('humanDot').style.background = colors[humanPlayer()];
       document.getElementById('agentDot').style.background = colors[agentPlayer()];
@@ -3517,8 +3513,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Play Orbit Wars manually against a local agent in a browser UI.")
     parser.add_argument(
         "--agent",
-        default="opening_improved_v1",
-        help="opening_improved_v0, opening_improved_v1, or path to an agent .py file",
+        default="v0",
+        help="v0 or path to an agent .py file",
     )
     parser.add_argument("--seat", choices=["first", "second"], default="first")
     parser.add_argument("--seed", type=int, default=20260507)

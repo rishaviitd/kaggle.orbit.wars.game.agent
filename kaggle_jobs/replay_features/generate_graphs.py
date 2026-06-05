@@ -5,8 +5,9 @@ from __future__ import annotations
 # Built by clean_builder.py from modules/utils.py + modules/analysis_utils.py
 # ============================================================
 import math
-import random
 import os
+import argparse
+from datetime import datetime
 from typing import Any
 import pandas as pd
 import numpy as np
@@ -20,105 +21,34 @@ except ImportError:
 import torch
 from torch_geometric.data import Data
 
-# ---- Dummy classes (replace kaggle_environments imports) ----
-class Planet:
-    def __init__(self, id, owner, x, y, radius, ships, production):
-        self.id = id
-        self.owner = owner
-        self.x = x
-        self.y = y
-        self.radius = radius
-        self.ships = ships
-        self.production = production
-
-class Fleet:
-    def __init__(self, id, owner, ships, x, y, angle, target_id):
-        self.id = id
-        self.owner = owner
-        self.ships = ships
-        self.x = x
-        self.y = y
-        self.angle = angle
-        self.target_id = target_id
-
 # ============================================================
-# Constants from utils.py
+# Constants
 # ============================================================
-CENTER = 50.0
-
-ROTATION_RADIUS_LIMIT = 50.0
-
-MAX_SPEED = 6.0
-
 SUN_RADIUS = 10.0
 
 BOARD_SIZE = 100.0
 
-MAX_COLLISION_TURN = 120
+STEP_NORMALIZER = 500.0
 
-FUTURE_SOURCE_LOOKAHEAD = 90
+PACKAGED_TARGET_DATE = None
 
-OPENING_SCORE_TURNS = 30
-
-OPPONENT_QUADRANT_ATTACK_STEP = 45
-
-# ============================================================
-# Physics Engine (from utils.py)
-# ============================================================
-def get(value, key, default=None):
-    if isinstance(value, dict):
-        return value.get(key, default)
-    return getattr(value, key, default)
-
-def fleet_speed(ships, max_speed=MAX_SPEED):
-    ships = max(1, int(ships))
-    if ships <= 1:
-        return 1.0
-    ratio = math.log(ships) / math.log(1000)
-    return min(1.0 + (max_speed - 1.0) * (ratio**1.5), max_speed)
-
-# ---- Public aliases ----
-
-# ============================================================
-# Constants from analysis_utils.py
-# ============================================================
-CENTER = 50.0
-
-ROTATION_RADIUS_LIMIT = 50.0
-
-MAX_COLLISION_TURN = 120
-
-MAX_SPEED = 6.0
-
-OPENING_SCORE_TURNS = 30
-
-OPENING_STRATEGIC_STEP_LIMIT = 60
-
-HIGH_PRODUCTION_MIN = 3
-
-LOW_PRODUCTION_PENALTIES = {1: 50.0, 2: 20.0}
-
-HIGH_PRODUCTION_FRONTIER_BONUS = {3: 10.0, 4: 20.0, 5: 30.0}
-
-ENEMY_CENTROID_RADIUS = 75.0
-
-ENEMY_CENTROID_WEIGHT = 0.75
-
-OVERHEAD_OUTLIER_FLOORS = {
-    "medium": 14.0,
-    "high": 12.0,
-}
-
-# ============================================================
-# Analysis Functions (from analysis_utils.py)
-# ============================================================
-
-def fleet_speed(ships: int, max_speed: float = MAX_SPEED) -> float:
-    ships = max(1, int(ships))
-    if ships <= 1:
-        return 1.0
-    ratio = math.log(ships) / math.log(1000)
-    return min(1.0 + (max_speed - 1.0) * (ratio**1.5), max_speed)
+NODE_FEATURE_NAMES = [
+    "is_mine",
+    "is_neutral",
+    "is_enemy_1",
+    "is_enemy_2",
+    "is_enemy_3",
+    "ships_norm",
+    "production_norm",
+    "step_norm",
+    "x_norm",
+    "y_norm",
+    "radius_norm",
+    "is_comet",
+    "is_2p",
+    "is_4p",
+    "angular_velocity",
+]
 
 def planet_from_row(row: Any) -> dict[str, Any]:
     return {
@@ -131,75 +61,23 @@ def planet_from_row(row: Any) -> dict[str, Any]:
         "production": int(row[6]),
     }
 
-def is_orbiting_planet(planet: dict[str, Any], initial_by_id: dict[int, Any], comet_ids: set[int]) -> bool:
-    if int(planet["id"]) in comet_ids:
-        return False
-    initial = initial_by_id.get(int(planet["id"]))
-    if initial is None:
-        return False
-    orbital_radius = math.hypot(float(initial[2]) - CENTER, float(initial[3]) - CENTER)
-    return orbital_radius + float(initial[4]) < ROTATION_RADIUS_LIMIT
-
-def quadrant(planet: dict[str, Any]) -> tuple[int, int]:
-    return (0 if float(planet["x"]) < CENTER else 1, 0 if float(planet["y"]) < CENTER else 1)
-
-def opposite_quadrant(q: tuple[int, int]) -> tuple[int, int]:
-    return (1 - q[0], 1 - q[1])
-
-def quadrant_center(q: tuple[int, int]) -> tuple[float, float]:
-    return (25.0 + 50.0 * q[0], 25.0 + 50.0 * q[1])
-
-def distance(a: dict[str, Any], b: dict[str, Any] | tuple[float, float]) -> float:
-    bx, by = (b if isinstance(b, tuple) else (float(b["x"]), float(b["y"])))
-    return math.hypot(float(a["x"]) - bx, float(a["y"]) - by)
-
-def home_quadrant(player_id: int, planets: list[dict[str, Any]], initial_planets: list[dict[str, Any]]) -> tuple[int, int] | None:
-    for planet in initial_planets:
-        if int(planet["owner"]) == int(player_id):
-            return quadrant(planet)
-    for planet in planets:
-        if int(planet["owner"]) == int(player_id):
-            return quadrant(planet)
-    return None
-
-def frontier_role_score(planet: dict[str, Any], reference_center: tuple[float, float]) -> float:
-    overhead = float(planet["ships"]) / max(1.0, float(planet["production"]))
-    reference_distance = distance(planet, reference_center)
-    return -5.0 * overhead - 3.0 * reference_distance + 2.0 * float(planet["production"])
-
-def source_target_path_distance(source: dict[str, Any], target: dict[str, Any]) -> float:
-    return max(0.0, distance(source, target) - float(source["radius"]) - float(target["radius"]))
-
 # ============================================================
 # STEP 4: Node Feature Extraction
 # ============================================================
-def extract_node_features_step_4(row, expert_player_id, planet_dicts=None, initial_planet_dicts=None):
+def extract_node_features_step_4(row, expert_player_id, planet_dicts=None):
     """
-    Step 4: Extract Strategic Features + Physics + Core Features
+    Extract a small set of raw and normalized planet features.
     """
     planets_array = row['planets']
-    initial_planets_array = row['initial_planets']
     comet_ids = set(row['comet_planet_ids']) if 'comet_planet_ids' in row else set()
 
-    # Build dictionaries for utils
-    initial_by_id = {int(p[0]): p for p in initial_planets_array}
-    
     if planet_dicts is None:
         planet_dicts = [planet_from_row(p) for p in planets_array]
-    if initial_planet_dicts is None:
-        initial_planet_dicts = [planet_from_row(p) for p in initial_planets_array]
-            
-    # Global incoming physics simulation removed to speed up extraction.
-    # The GNN will learn threats from the temporal fleet edge buckets instead.
-
-    # Calculate Quadrant centers for Frontier Role Scoring
-    home_q = home_quadrant(expert_player_id, planet_dicts, initial_planet_dicts)
-    if home_q is not None:
-        home_center = quadrant_center(home_q)
-        enemy_center = quadrant_center(opposite_quadrant(home_q))
-    else:
-        home_center = (50.0, 50.0)
-        enemy_center = (50.0, 50.0)
+    player_count = int(row.get("player_count", 0) or 0)
+    step_norm = float(row.get("step", 0) or 0) / STEP_NORMALIZER
+    angular_velocity = float(row.get("angular_velocity", 0.0) or 0.0)
+    is_2p = 1.0 if player_count == 2 else 0.0
+    is_4p = 1.0 if player_count == 4 else 0.0
 
     node_features = []
     all_player_ids = {0, 1, 2, 3}
@@ -211,7 +89,6 @@ def extract_node_features_step_4(row, expert_player_id, planet_dicts=None, initi
     for p_dict in planet_dicts:
         owner = p_dict["owner"]
         
-        # Core
         is_mine = 1.0 if owner == expert_player_id else 0.0
         is_neutral = 1.0 if owner == -1 else 0.0
         is_e1 = 1.0 if owner == e1 else 0.0
@@ -219,18 +96,19 @@ def extract_node_features_step_4(row, expert_player_id, planet_dicts=None, initi
         is_e3 = 1.0 if owner == e3 else 0.0
         norm_ships = p_dict["ships"] / 100.0
         norm_prod = p_dict["production"] / 5.0
-        
-        # Step 3 Physics
-        orbiting = 1.0 if is_orbiting_planet(p_dict, initial_by_id, comet_ids) else 0.0
-
-        # Score how valuable this planet is as a frontline or backline
-        f_score_home = frontier_role_score(p_dict, home_center) / 100.0
-        f_score_enemy = frontier_role_score(p_dict, enemy_center) / 100.0
+        is_comet = 1.0 if int(p_dict["id"]) in comet_ids else 0.0
         
         features = [
             is_mine, is_neutral, is_e1, is_e2, is_e3, 
             norm_ships, norm_prod,
-            orbiting, f_score_home, f_score_enemy
+            step_norm,
+            float(p_dict["x"]) / BOARD_SIZE,
+            float(p_dict["y"]) / BOARD_SIZE,
+            float(p_dict["radius"]) / SUN_RADIUS,
+            is_comet,
+            is_2p,
+            is_4p,
+            angular_velocity,
         ]
         node_features.append(features)
         
@@ -241,111 +119,101 @@ def extract_node_features_step_4(row, expert_player_id, planet_dicts=None, initi
 # ============================================================
 def extract_edge_features_step_6(row, expert_player_id, planet_dicts=None):
     """
-    Step 6: Extract Base Edge Features + Temporal Fleet Buckets
-    Creates a fully connected directed graph (excluding self-loops).
-    Returns edge_index [2, E] and edge_features [E, 18].
+    Create a fully connected graph with only relative geometry.
     """
     planets_array = row['planets']
-    fleets_array = row['fleets']
     
     if planet_dicts is None:
         planet_dicts = [planet_from_row(p) for p in planets_array]
     num_planets = len(planet_dicts)
     
-    all_player_ids = {0, 1, 2, 3}
-    enemy_ids = sorted(list(all_player_ids - {expert_player_id}))
-    if len(enemy_ids) < 3:
-        enemy_ids += [-99] * (3 - len(enemy_ids))
-    e1, e2, e3 = enemy_ids[0], enemy_ids[1], enemy_ids[2]
-    
-    # Pre-group fleets by (source_id, target_id)
-    edge_fleets = {}
-    for f in fleets_array:
-        f_owner = int(f[1])
-        f_ships = float(f[2])
-        f_x = float(f[3])
-        f_y = float(f[4])
-        s_id = int(f[5])
-        t_id = int(f[6])
-        
-        edge_key = (s_id, t_id)
-        if edge_key not in edge_fleets:
-            edge_fleets[edge_key] = []
-        edge_fleets[edge_key].append((f_owner, f_ships, f_x, f_y))
-    
     edge_index_t, edge_pairs = get_full_directed_edge_template(num_planets)
-    edge_features = np.zeros((len(edge_pairs), 42), dtype=np.float64)
-    
-    baseline_speed = fleet_speed(1, MAX_SPEED)
+    edge_features = np.zeros((len(edge_pairs), 3), dtype=np.float32)
     
     for edge_idx, (i, j) in enumerate(edge_pairs):
         source = planet_dicts[i]
         target = planet_dicts[j]
-        s_id = source['id']
-        t_id = target['id']
-        
-        # 1. Spatial Features
-        path_distance = source_target_path_distance(source, target)
-        travel_turns = math.ceil(path_distance / baseline_speed)
-        
-        edge_features[edge_idx, 0] = path_distance / 100.0
-        edge_features[edge_idx, 1] = travel_turns / 100.0
-        
-        for owner, fleet_ships, fleet_x, fleet_y in edge_fleets.get((s_id, t_id), ()):
-            # Calculate ETA
-            dist_to_target = math.hypot(target['x'] - fleet_x, target['y'] - fleet_y) - target['radius']
-            dist_to_target = max(0.0, dist_to_target)
-            speed = fleet_speed(fleet_ships, MAX_SPEED)
-            eta = math.ceil(dist_to_target / speed)
-            
-            bucket_idx = min(9, int(eta // 5))
-            
-            norm_ships = fleet_ships / 100.0
-            if owner == expert_player_id:
-                edge_features[edge_idx, 2 + bucket_idx] += norm_ships
-            elif owner == e1:
-                edge_features[edge_idx, 12 + bucket_idx] += norm_ships
-            elif owner == e2:
-                edge_features[edge_idx, 22 + bucket_idx] += norm_ships
-            elif owner == e3:
-                edge_features[edge_idx, 32 + bucket_idx] += norm_ships
+        dx = (float(target["x"]) - float(source["x"])) / BOARD_SIZE
+        dy = (float(target["y"]) - float(source["y"])) / BOARD_SIZE
+        edge_features[edge_idx] = (dx, dy, math.hypot(dx, dy))
     
     edge_attr = torch.tensor(edge_features, dtype=torch.float32)
     
     return edge_index_t, edge_attr
 
+def edge_attr_from_node_features(x, edge_index):
+    x_col = NODE_FEATURE_NAMES.index("x_norm")
+    y_col = NODE_FEATURE_NAMES.index("y_norm")
+    source_indices = edge_index[0]
+    target_indices = edge_index[1]
+    dx = x[target_indices, x_col] - x[source_indices, x_col]
+    dy = x[target_indices, y_col] - x[source_indices, y_col]
+    return torch.stack([dx, dy, torch.sqrt(dx * dx + dy * dy)], dim=1)
+
 # ============================================================
 # STEP 7: Label Extraction
 # ============================================================
-def extract_labels_step_7(row, expert_player_id):
+def extract_labels_step_7(
+    row,
+    expert_player_id,
+    planet_dicts,
+):
     """
-    Step 7: Extract y_intent and y_fraction labels.
+    Extract direct per-source labels from [source_id, angle, ships] actions.
+
+    Multiple launches from one source are merged using ship-weighted direction
+    and total sent fraction. This is intentionally simple for the baseline.
     """
-    planets_array = row['planets']
-    num_planets = len(planets_array)
-    
-    action = row.get('action', None)
-    
-    y_intent = torch.zeros(num_planets, 1, dtype=torch.float32)
-    y_fraction = torch.zeros(num_planets, 1, dtype=torch.float32)
-    
-    if action is None or not isinstance(action, dict):
-        return y_intent, y_fraction
-        
-    target_id = action.get('target_id', None)
-    ships_percent = action.get('ships_percent', 0.0)
-    
-    if target_id is None:
-        return y_intent, y_fraction
-        
-    planet_id_to_idx = {int(p[0]): idx for idx, p in enumerate(planets_array)}
-    
-    if target_id in planet_id_to_idx:
-        idx = planet_id_to_idx[target_id]
-        y_intent[idx] = 1.0
-        y_fraction[idx] = float(ships_percent) / 100.0
-        
-    return y_intent, y_fraction
+    num_nodes = len(planet_dicts)
+    y_source_fire = torch.zeros(num_nodes, 1, dtype=torch.float32)
+    y_angle_sin = torch.zeros(num_nodes, 1, dtype=torch.float32)
+    y_angle_cos = torch.zeros(num_nodes, 1, dtype=torch.float32)
+    y_ship_fraction = torch.zeros(num_nodes, 1, dtype=torch.float32)
+    angle_weight = torch.zeros(num_nodes, 1, dtype=torch.float32)
+
+    actions = row.get("action")
+    if actions is None:
+        actions = []
+    planet_id_to_idx = {int(p["id"]): idx for idx, p in enumerate(planet_dicts)}
+    total_actions = 0
+
+    for move in actions:
+        if move is None or len(move) < 3:
+            continue
+        total_actions += 1
+        source_id = int(move[0])
+        angle = float(move[1])
+        ships = float(move[2])
+        source_idx = planet_id_to_idx.get(source_id)
+        if source_idx is None or ships <= 0:
+            continue
+
+        source = planet_dicts[source_idx]
+        source_ships = max(1.0, float(source["ships"]))
+        weight = max(1.0, ships)
+        y_source_fire[source_idx] = 1.0
+        y_angle_sin[source_idx] += math.sin(angle) * weight
+        y_angle_cos[source_idx] += math.cos(angle) * weight
+        angle_weight[source_idx] += weight
+        y_ship_fraction[source_idx] += ships / source_ships
+
+    active = angle_weight[:, 0] > 0
+    if active.any():
+        y_angle_sin[active] /= angle_weight[active]
+        y_angle_cos[active] /= angle_weight[active]
+        magnitude = torch.sqrt(y_angle_sin[active] ** 2 + y_angle_cos[active] ** 2).clamp_min(1e-8)
+        y_angle_sin[active] /= magnitude
+        y_angle_cos[active] /= magnitude
+    y_ship_fraction.clamp_(0.0, 1.0)
+
+    return (
+        y_source_fire,
+        y_angle_sin,
+        y_angle_cos,
+        y_ship_fraction,
+        total_actions,
+        int(y_source_fire.sum().item()),
+    )
 
 # ============================================================
 # MAIN: Generate PyG Data Object
@@ -356,20 +224,29 @@ def generate_pyg_data(row_dict):
     """
     expert_player_id = int(row_dict.get('expert_player_id', 0))
     planet_dicts = [planet_from_row(p) for p in row_dict['planets']]
-    initial_planet_dicts = [planet_from_row(p) for p in row_dict['initial_planets']]
     
     node_features = extract_node_features_step_4(
         row_dict,
         expert_player_id,
         planet_dicts=planet_dicts,
-        initial_planet_dicts=initial_planet_dicts,
     )
     edge_index, edge_attr = extract_edge_features_step_6(
         row_dict,
         expert_player_id,
         planet_dicts=planet_dicts,
     )
-    y_intent, y_fraction = extract_labels_step_7(row_dict, expert_player_id)
+    (
+        y_source_fire,
+        y_angle_sin,
+        y_angle_cos,
+        y_ship_fraction,
+        num_actions,
+        num_action_sources,
+    ) = extract_labels_step_7(
+        row_dict,
+        expert_player_id,
+        planet_dicts,
+    )
     
     x = torch.tensor(node_features, dtype=torch.float32)
     
@@ -377,8 +254,12 @@ def generate_pyg_data(row_dict):
         x=x,
         edge_index=edge_index,
         edge_attr=edge_attr,
-        y_intent=y_intent,
-        y_fraction=y_fraction,
+        y_source_fire=y_source_fire,
+        y_angle_sin=y_angle_sin,
+        y_angle_cos=y_angle_cos,
+        y_ship_fraction=y_ship_fraction,
+        num_actions=torch.tensor(num_actions, dtype=torch.int16),
+        num_action_sources=torch.tensor(num_action_sources, dtype=torch.int16),
     )
     
     return data
@@ -412,9 +293,8 @@ def process_row_task(row_dict):
 
 def pack_graphs(graphs):
     """
-    Store graph tensors compactly while preserving the same training data.
-    Graphs are grouped by node count so each tensor stack has fixed shapes.
-    Edge features are split into dense spatial columns and sparse fleet buckets.
+    Store simple baseline graphs grouped by node count.
+    Action labels are sparse because most source planets do not launch.
     """
     groups = {}
     for original_idx, graph in enumerate(graphs):
@@ -423,97 +303,117 @@ def pack_graphs(graphs):
             "indices": [],
             "edge_index": graph.edge_index,
             "x": [],
-            "edge_static": [],
-            "edge_bucket_indices": [],
-            "edge_bucket_values": [],
-            "y_intent": [],
-            "y_fraction": [],
+            "action_label_indices": [],
+            "action_label_values": [],
+            "num_actions": [],
+            "num_action_sources": [],
         })
-        edge_buckets = graph.edge_attr[:, 2:]
-        bucket_indices = torch.nonzero(edge_buckets, as_tuple=False)
-        if bucket_indices.numel() > 0:
-            graph_col = torch.full((bucket_indices.size(0), 1), len(group["indices"]), dtype=torch.long)
-            group["edge_bucket_indices"].append(torch.cat([graph_col, bucket_indices], dim=1))
-            group["edge_bucket_values"].append(edge_buckets[bucket_indices[:, 0], bucket_indices[:, 1]])
 
         group["indices"].append(original_idx)
         group["x"].append(graph.x)
-        group["edge_static"].append(graph.edge_attr[:, :2])
-        group["y_intent"].append(graph.y_intent)
-        group["y_fraction"].append(graph.y_fraction)
+        action_nodes = torch.nonzero(graph.y_source_fire[:, 0] > 0, as_tuple=False)[:, 0]
+        if action_nodes.numel() > 0:
+            graph_col = torch.full(
+                (action_nodes.size(0), 1),
+                len(group["indices"]) - 1,
+                dtype=torch.long,
+            )
+            group["action_label_indices"].append(
+                torch.cat([graph_col, action_nodes[:, None]], dim=1)
+            )
+            group["action_label_values"].append(
+                torch.cat(
+                    [
+                        graph.y_angle_sin[action_nodes],
+                        graph.y_angle_cos[action_nodes],
+                        graph.y_ship_fraction[action_nodes],
+                    ],
+                    dim=1,
+                )
+            )
+        group["num_actions"].append(graph.num_actions)
+        group["num_action_sources"].append(graph.num_action_sources)
 
     packed_groups = {}
     for num_nodes, group in groups.items():
         key = str(num_nodes)
-        if group["edge_bucket_indices"]:
-            edge_bucket_indices = torch.cat(group["edge_bucket_indices"], dim=0).to(torch.int32)
-            edge_bucket_values = torch.cat(group["edge_bucket_values"], dim=0)
+        if group["action_label_indices"]:
+            action_label_indices = torch.cat(group["action_label_indices"], dim=0).to(torch.int32)
+            action_label_values = torch.cat(group["action_label_values"], dim=0)
         else:
-            edge_bucket_indices = torch.empty((0, 3), dtype=torch.int32)
-            edge_bucket_values = torch.empty((0,), dtype=torch.float32)
+            action_label_indices = torch.empty((0, 2), dtype=torch.int32)
+            action_label_values = torch.empty((0, 3), dtype=torch.float32)
 
         packed_groups[key] = {
             "indices": torch.tensor(group["indices"], dtype=torch.long),
             "edge_index": group["edge_index"],
             "x": torch.stack(group["x"], dim=0),
-            "edge_static": torch.stack(group["edge_static"], dim=0),
-            "edge_bucket_indices": edge_bucket_indices,
-            "edge_bucket_values": edge_bucket_values,
-            "y_intent": torch.stack(group["y_intent"], dim=0),
-            "y_fraction": torch.stack(group["y_fraction"], dim=0),
+            "action_label_indices": action_label_indices,
+            "action_label_values": action_label_values,
+            "num_actions": torch.stack(group["num_actions"], dim=0),
+            "num_action_sources": torch.stack(group["num_action_sources"], dim=0),
         }
 
     return {
-        "format": "packed_pyg_graphs_v2",
+        "format": "packed_pyg_graphs_v5_simple",
         "num_graphs": len(graphs),
+        "node_feature_names": NODE_FEATURE_NAMES,
+        "label_names": [
+            "y_source_fire",
+            "y_angle_sin",
+            "y_angle_cos",
+            "y_ship_fraction",
+        ],
+        "action_label_value_layout": [
+            "angle_sin",
+            "angle_cos",
+            "ship_fraction",
+        ],
+        "action_alignment": "observation_at_step_t_with_action_stored_at_step_t_plus_1",
         "edge_attr_layout": {
-            "static_cols": 2,
-            "bucket_cols": 40,
-            "total_cols": 42,
+            "names": ["dx_norm", "dy_norm", "distance_norm"],
+            "total_cols": 3,
+            "storage": "derived_from_node_xy_at_load_time",
         },
+        "notes": "No fleet trajectory simulation or physics-derived target labels.",
         "groups": packed_groups,
     }
 
 def unpack_packed_graphs(payload):
-    """
-    Convert a packed chunk back into a list of PyG Data objects.
-    This is useful for future training code that wants the old format.
-    """
-    if isinstance(payload, list):
-        return payload
-    if not isinstance(payload, dict) or payload.get("format") not in {"packed_pyg_graphs_v1", "packed_pyg_graphs_v2"}:
+    """Convert a simple packed chunk back into PyG Data objects."""
+    if not isinstance(payload, dict) or payload.get("format") != "packed_pyg_graphs_v5_simple":
         raise ValueError("Unsupported graph payload format")
 
     graphs = [None] * int(payload["num_graphs"])
     for group in payload["groups"].values():
-        indices = group["indices"].tolist()
-        if "edge_attr" in group:
-            edge_attr = group["edge_attr"]
-        else:
-            edge_attr = torch.zeros(
-                (
-                    group["x"].size(0),
-                    group["edge_static"].size(1),
-                    payload["edge_attr_layout"]["total_cols"],
-                ),
-                dtype=group["edge_static"].dtype,
-            )
-            edge_attr[:, :, :2] = group["edge_static"]
-            bucket_indices = group["edge_bucket_indices"].long()
-            if bucket_indices.numel() > 0:
-                edge_attr[
-                    bucket_indices[:, 0],
-                    bucket_indices[:, 1],
-                    bucket_indices[:, 2] + 2,
-                ] = group["edge_bucket_values"]
-
-        for local_idx, original_idx in enumerate(indices):
+        action_indices = group["action_label_indices"].long()
+        for local_idx, original_idx in enumerate(group["indices"].tolist()):
+            num_nodes = group["x"].size(1)
+            y_source_fire = torch.zeros((num_nodes, 1), dtype=group["x"].dtype)
+            y_angle_sin = torch.zeros((num_nodes, 1), dtype=group["x"].dtype)
+            y_angle_cos = torch.zeros((num_nodes, 1), dtype=group["x"].dtype)
+            y_ship_fraction = torch.zeros((num_nodes, 1), dtype=group["x"].dtype)
+            action_mask = action_indices[:, 0] == local_idx
+            action_nodes = action_indices[action_mask, 1]
+            action_values = group["action_label_values"][action_mask]
+            if action_nodes.numel() > 0:
+                y_source_fire[action_nodes] = 1.0
+                y_angle_sin[action_nodes] = action_values[:, 0:1]
+                y_angle_cos[action_nodes] = action_values[:, 1:2]
+                y_ship_fraction[action_nodes] = action_values[:, 2:3]
             graphs[original_idx] = Data(
                 x=group["x"][local_idx],
                 edge_index=group["edge_index"],
-                edge_attr=edge_attr[local_idx],
-                y_intent=group["y_intent"][local_idx],
-                y_fraction=group["y_fraction"][local_idx],
+                edge_attr=edge_attr_from_node_features(
+                    group["x"][local_idx],
+                    group["edge_index"],
+                ),
+                y_source_fire=y_source_fire,
+                y_angle_sin=y_angle_sin,
+                y_angle_cos=y_angle_cos,
+                y_ship_fraction=y_ship_fraction,
+                num_actions=group["num_actions"][local_idx],
+                num_action_sources=group["num_action_sources"][local_idx],
             )
     return graphs
 
@@ -528,6 +428,24 @@ def process_chunk_rows(chunk_rows, pool, pool_chunksize):
         return [process_row_task(row) for row in chunk_rows]
     return pool.map(process_row_task, chunk_rows, chunksize=pool_chunksize)
 
+def align_actions_to_observations(df):
+    required = {"game_id", "step", "action"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(
+            "Cannot align replay actions; missing parquet columns: "
+            + ", ".join(sorted(missing))
+        )
+
+    aligned = df.sort_values(["game_id", "step"], kind="stable").reset_index(drop=True)
+    groups = aligned.groupby("game_id", sort=False)
+    next_actions = groups["action"].shift(-1)
+    next_steps = groups["step"].shift(-1)
+    valid = next_steps.eq(aligned["step"] + 1)
+    aligned = aligned.loc[valid].copy()
+    aligned["action"] = next_actions.loc[valid].to_numpy()
+    return aligned
+
 def find_batch_files(input_dir):
     patterns = ("batch_*.parquet", "batch-*.parquet")
     files = []
@@ -535,7 +453,34 @@ def find_batch_files(input_dir):
         files.extend(glob.glob(f"{input_dir}/**/{pattern}", recursive=True))
     return sorted(set(files))
 
-def process_kaggle_batches(input_dir="/kaggle/input/minified-replay-data-p1", output_dir="/kaggle/working/pyg_chunks", local_mode=False):
+def validate_target_date(value):
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("date must use YYYY-MM-DD format") from exc
+    return value
+
+def resolve_date_input_dir(input_dir, target_date):
+    direct = os.path.join(input_dir, target_date)
+    if os.path.isdir(direct):
+        return direct
+
+    matches = sorted(
+        path for path in glob.glob(f"/kaggle/input/**/{target_date}", recursive=True)
+        if os.path.isdir(path) and find_batch_files(path)
+    )
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        return direct
+    raise RuntimeError(f"Multiple Kaggle inputs contain date {target_date}: {matches}")
+
+def process_kaggle_batches(
+    input_dir="/kaggle/input/orbit-datewise-replay-minify-fullmeta-latest10",
+    output_dir="/kaggle/working/pyg_chunks",
+    local_mode=False,
+    target_date=None,
+):
     # Override for local testing if running locally
     if local_mode:
         input_dir = "data"
@@ -545,18 +490,23 @@ def process_kaggle_batches(input_dir="/kaggle/input/minified-replay-data-p1", ou
     print(f"Input : {input_dir}")
     print(f"Output: {output_dir}")
     
+    if target_date:
+        input_dir = resolve_date_input_dir(input_dir, target_date)
+        output_dir = os.path.join(output_dir, target_date)
+        print(f"Target date: {target_date}")
+
     batch_files = find_batch_files(input_dir)
     
     if not batch_files:
         print("No batch files found! Please check the input path.")
         return
     
-    print(f"Found {len(batch_files)} batches to process.")
+    print(f"Found {len(batch_files)} parquet batches to process.")
     os.makedirs(output_dir, exist_ok=True)
     
     total_batches = len(batch_files)
     import multiprocessing
-    num_cores = min(env_int("PYG_NUM_CORES", 4), max(1, multiprocessing.cpu_count()))
+    num_cores = min(env_int("PYG_NUM_CORES", 1), max(1, multiprocessing.cpu_count()))
     chunk_size = env_int("PYG_CHUNK_SIZE", 5000)
     pool_chunksize = env_int("PYG_POOL_CHUNKSIZE", 128)
     start_batch_index = max(1, env_int("PYG_START_BATCH_INDEX", 1))
@@ -569,8 +519,11 @@ def process_kaggle_batches(input_dir="/kaggle/input/minified-replay-data-p1", ou
     print(f"Using {num_cores} CPU cores for parallel extraction.")
     print(f"Chunk size: {chunk_size}; pool chunksize: {pool_chunksize}.")
     print(f"Selected parquet batch files: {start_batch_index}-{end_batch_index} of {total_batches} ({selected_total_batches} files).")
-    print("Output format: packed_pyg_graphs_v2.")
+    print("Output format: packed_pyg_graphs_v5_simple.")
     global_start = time.time()
+    pipeline_actions = 0
+    pipeline_action_sources = 0
+    pipeline_failed_rows = 0
 
     pool = None
     if num_cores > 1:
@@ -585,6 +538,9 @@ def process_kaggle_batches(input_dir="/kaggle/input/minified-replay-data-p1", ou
             print(f"\n[{absolute_batch_index}/{total_batches}] Processing {rel_path}...")
             
             df = pd.read_parquet(file)
+            raw_rows = len(df)
+            df = align_actions_to_observations(df)
+            print(f"  -> Aligned {len(df)} trainable states from {raw_rows} replay rows.")
             
             total_rows = len(df)
             for chunk_idx in range(0, total_rows, chunk_size):
@@ -594,6 +550,11 @@ def process_kaggle_batches(input_dir="/kaggle/input/minified-replay-data-p1", ou
                 chunk_start = time.time()
                 graphs = process_chunk_rows(chunk_rows, pool, pool_chunksize)
                 valid_graphs = [g for g in graphs if g is not None]
+                pipeline_failed_rows += len(graphs) - len(valid_graphs)
+                chunk_actions = sum(int(g.num_actions) for g in valid_graphs)
+                chunk_action_sources = sum(int(g.num_action_sources) for g in valid_graphs)
+                pipeline_actions += chunk_actions
+                pipeline_action_sources += chunk_action_sources
                 
                 chunk_id = chunk_idx // chunk_size
                 chunk_output_dir = os.path.join(output_dir, rel_parent)
@@ -612,6 +573,11 @@ def process_kaggle_batches(input_dir="/kaggle/input/minified-replay-data-p1", ou
                 elapsed = time.time() - chunk_start
                 rps = len(chunk_rows) / elapsed
                 print(f"  -> Saved {len(valid_graphs)} graphs to {out_file} (packed, {rps:.2f} rows/s)")
+                if chunk_actions:
+                    print(
+                        f"     Actions represented: {chunk_actions} launches "
+                        f"across {chunk_action_sources} source labels."
+                    )
 
                 del graphs, valid_graphs, payload, chunk_rows, chunk_df
                 gc.collect()
@@ -625,8 +591,25 @@ def process_kaggle_batches(input_dir="/kaggle/input/minified-replay-data-p1", ou
             pool.join()
 
     print(f"\n\u2705 All batches processed successfully in {(time.time()-global_start)/60:.2f} minutes!")
+    if pipeline_actions:
+        print(
+            f"Actions represented: {pipeline_actions} launches across "
+            f"{pipeline_action_sources} source labels."
+        )
+    print(f"Rows skipped after extraction errors: {pipeline_failed_rows}")
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--date",
+        type=validate_target_date,
+        default=os.environ.get("PYG_TARGET_DATE") or PACKAGED_TARGET_DATE,
+        help="Process one date in YYYY-MM-DD format.",
+    )
+    args = parser.parse_args()
+    if not args.date:
+        parser.error("--date is required (or set PYG_TARGET_DATE)")
+
     # Automatically detect if running on Kaggle
     is_kaggle = os.path.exists("/kaggle")
-    process_kaggle_batches(local_mode=not is_kaggle)
+    process_kaggle_batches(local_mode=not is_kaggle, target_date=args.date)
