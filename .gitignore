@@ -6,7 +6,6 @@ venv/
 ENV/
 env.bak/
 venv.bak/
-__init__.py
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
