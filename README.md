@@ -118,16 +118,16 @@ Final score = total ships on owned planets + total ships in owned fleets. Highes
 
 ## Observation Reference
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `planets` | `[[id, owner, x, y, radius, ships, production], ...]` | All planets including comets |
-| `fleets` | `[[id, owner, x, y, angle, from_planet_id, ships], ...]` | All active fleets |
-| `player` | `int` | Your player ID (0-3) |
-| `angular_velocity` | `float` | Planet rotation speed (radians/turn) |
-| `initial_planets` | `[[id, owner, x, y, radius, ships, production], ...]` | Planet positions at game start |
-| `comets` | `[{planet_ids, paths, path_index}, ...]` | Active comet group data |
-| `comet_planet_ids` | `[int, ...]` | Planet IDs that are comets |
-| `remainingOverageTime` | `float` | Remaining overage time budget (seconds) |
+| Field                  | Type                                                     | Description                             |
+| ---------------------- | -------------------------------------------------------- | --------------------------------------- |
+| `planets`              | `[[id, owner, x, y, radius, ships, production], ...]`    | All planets including comets            |
+| `fleets`               | `[[id, owner, x, y, angle, from_planet_id, ships], ...]` | All active fleets                       |
+| `player`               | `int`                                                    | Your player ID (0-3)                    |
+| `angular_velocity`     | `float`                                                  | Planet rotation speed (radians/turn)    |
+| `initial_planets`      | `[[id, owner, x, y, radius, ships, production], ...]`    | Planet positions at game start          |
+| `comets`               | `[{planet_ids, paths, path_index}, ...]`                 | Active comet group data                 |
+| `comet_planet_ids`     | `[int, ...]`                                             | Planet IDs that are comets              |
+| `remainingOverageTime` | `float`                                                  | Remaining overage time budget (seconds) |
 
 ## Action Format
 
@@ -163,11 +163,58 @@ def agent(obs):
 
 ## Configuration
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `episodeSteps` | 500 | Maximum number of turns |
-| `actTimeout` | 1 | Seconds per turn |
-| `shipSpeed` | 6.0 | Maximum fleet speed |
-| `sunRadius` | 10.0 | Radius of the sun |
-| `boardSize` | 100.0 | Board dimensions |
-| `cometSpeed` | 4.0 | Comet speed (units/turn) |
+| Parameter      | Default | Description              |
+| -------------- | ------- | ------------------------ |
+| `episodeSteps` | 500     | Maximum number of turns  |
+| `actTimeout`   | 1       | Seconds per turn         |
+| `shipSpeed`    | 6.0     | Maximum fleet speed      |
+| `sunRadius`    | 10.0    | Radius of the sun        |
+| `boardSize`    | 100.0   | Board dimensions         |
+| `cometSpeed`   | 4.0     | Comet speed (units/turn) |
+
+The Kaggle Orbit Wars competition is actively running until June 2026. Because the competition is still underway, there is no single "final winning solution" yet. [1, 2]
+However, top-tier competitors currently dominating the leaderboard (such as Jake Will and TonyK) and the community's active research threads have shared the exact architectures and technical strategies driving the highest-ranking bots: [3, 4]
+
+## 1. Environment Rewriting for Speed (The JAX/Numba Route)
+
+A major bottleneck in training an agent for a complex, 500-turn 2D space simulation is execution speed. Top players noted that using the raw Python environment provided by Kaggle is far too slow for deep reinforcement learning. [1, 3]
+
+- The Solution: Competitors rewrote the backend physics and simulation environment in JAX or Numba to enable massive parallelization.
+- The Impact: This pushed simulation speeds up to ~10,000 Steps Per Second (SPS), making sample-heavy reinforcement learning feasible. [3]
+
+## 2. Neural Network Architecture: Entity Transformers
+
+Because the board state scales dynamically (the number of active planets, flying comets, and traveling fleets changes every single turn), standard feed-forward networks fail. [2]
+
+- The Solution: Leading agents use an Entity Transformer model.
+- How it works: The transformer treats every planet and fleet as an independent "token." This allows the network to process an arbitrary number of objects on the board seamlessly, dynamically calculating relationships and spatial threats between them regardless of how many units are alive. [3]
+
+## 3. Algorithm & Policy Optimization (PPO & REINFORCE)
+
+Pure heuristics (like a simple "nearest planet sniper" bot) max out early on the leaderboard. Top players rely on Proximal Policy Optimization (PPO) or REINFORCE with custom modifications: [2, 5]
+
+- No Discount Factor: Because games have a fixed terminal boundary of exactly 500 steps, top solutions do not use a discount factor (γ = 1.0). Applying standard discounting shrinks the endgame reward signal so much that the agent struggles to value long-term planetary conquest. [6, 7]
+- Adaptive Entropy Scaling: To prevent the policy from collapsing and becoming overconfident in narrow, predictable strategies, developers use a proportional entropy penalty. If entropy drops too low, they scale up the exploration bonus aggressively to keep the agent searching for creative maneuvers. [7]
+
+## 4. Advanced Geometric Feature Engineering [8]
+
+While deep learning can theoretically learn everything from scratch, players lack the massive compute scale of companies like OpenAI. [3]
+
+- The Solution: Top bots inject strong inductive biases (pre-calculated geometry math) directly into the model inputs. This includes swept-pair collision checking (quadratic equations predicting exactly if and when a fleet's straight line will intersect a planet's moving orbital path during a tick) and precise travel-time vectors to future planet positions. [3, 9, 10]
+
+## 5. Training Strategy: Data Mining Top Replays
+
+To fast-track training, the community utilizes the Orbit Wars top-10% daily episode replay datasets. Competitors download the JSON files of the highest-rated matchups from the live leaderboard to kickstart their agents via Imitation Learning (Behavioral Cloning) before turning on Self-Play. [11]
+Are you planning to build an agent using deep reinforcement learning (like PyTorch or JAX), or are you trying to write a high-performance geometric heuristic bot? I can give you code templates for either approach!
+
+[1] [https://www.kaggle.com](https://www.kaggle.com/competitions/orbit-wars)
+[2] [https://www.kaggle.com](https://www.kaggle.com/competitions/orbit-wars)
+[3] [https://www.kaggle.com](https://www.kaggle.com/competitions/orbit-wars/discussion/697725)
+[4] [https://www.kaggle.com](https://www.kaggle.com/competitions/orbit-wars/leaderboard)
+[5] [https://www.kaggle.com](https://www.kaggle.com/competitions/orbit-wars/discussion/693755)
+[6] [https://www.kaggle.com](https://www.kaggle.com/competitions/orbit-wars/discussion/693020)
+[7] [https://www.kaggle.com](https://www.kaggle.com/competitions/orbit-wars/discussion/693020)
+[8] [https://www.kaggle.com](https://www.kaggle.com/competitions/orbit-wars/discussion/697725)
+[9] [https://www.kaggle.com](https://www.kaggle.com/competitions/orbit-wars)
+[10] [https://www.kaggle.com](https://www.kaggle.com/competitions/orbit-wars/discussion/696043)
+[11] [https://www.kaggle.com](https://www.kaggle.com/competitions/orbit-wars/discussion/697413)

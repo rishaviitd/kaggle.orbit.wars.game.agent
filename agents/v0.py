@@ -66,10 +66,15 @@ OPENING_SCORE_TURNS = 30
 OPPONENT_QUADRANT_ATTACK_STEP = 45
 AGENT_TIME_BUDGET_SECONDS = 0.85
 LOW_OVERAGE_TIME_BUDGET_SECONDS = 0.30
+COLLISION_FILTER_EPSILON = 1e-7
 OVERHEAD_OUTLIER_FLOORS = {
     "medium": 14.0,
     "high": 12.0,
 }
+
+_FLEET_HIT_CACHE: dict[int, tuple[tuple[int, int, int, float], int, int]] = {}
+_FLEET_HIT_CACHE_EPISODE_SIGNATURE: tuple[Any, ...] | None = None
+_FLEET_HIT_CACHE_LAST_STEP: int | None = None
 
 
 def get(value: Any, key: str, default: Any = None) -> Any:
@@ -319,25 +324,36 @@ def moving_blocker_collision_time(
         blocker_x, blocker_y = blocker_position(hit_time)
         return math.hypot(fleet_x - blocker_x, fleet_y - blocker_y) - blocker.radius
 
-    def derivative_at(hit_time: float) -> float:
+    def margin_and_derivative_at(hit_time: float) -> tuple[float, float]:
         fleet_x = start_x + dir_x * speed * hit_time
         fleet_y = start_y + dir_y * speed * hit_time
-        blocker_x, blocker_y = blocker_position(hit_time)
+        if not blocker_orbits:
+            blocker_x = blocker.x
+            blocker_y = blocker.y
+            blocker_vx = blocker_vy = 0.0
+        else:
+            env_time = max(1, int(current_step)) + hit_time - 1
+            future_angle = initial_angle + angular_velocity * env_time
+            future_cos = math.cos(future_angle)
+            future_sin = math.sin(future_angle)
+            if hit_time <= 0.0:
+                blocker_x = blocker.x
+                blocker_y = blocker.y
+            else:
+                blocker_x = CENTER + orbital_radius * future_cos
+                blocker_y = CENTER + orbital_radius * future_sin
+            blocker_vx = -orbital_radius * angular_velocity * future_sin
+            blocker_vy = orbital_radius * angular_velocity * future_cos
         dx = fleet_x - blocker_x
         dy = fleet_y - blocker_y
         dist = math.hypot(dx, dy)
+        margin = dist - blocker.radius
         if dist == 0:
-            return -speed
-        if blocker_orbits:
-            env_time = max(1, int(current_step)) + hit_time - 1
-            future_angle = initial_angle + angular_velocity * env_time
-            blocker_vx = -orbital_radius * angular_velocity * math.sin(future_angle)
-            blocker_vy = orbital_radius * angular_velocity * math.cos(future_angle)
-        else:
-            blocker_vx = blocker_vy = 0.0
+            return margin, -speed
         relative_vx = dir_x * speed - blocker_vx
         relative_vy = dir_y * speed - blocker_vy
-        return (dx * relative_vx + dy * relative_vy) / dist
+        derivative = (dx * relative_vx + dy * relative_vy) / dist
+        return margin, derivative
 
     projection_time = ((blocker.x - start_x) * dir_x + (blocker.y - start_y) * dir_y) / speed
     seed_times = []
@@ -349,10 +365,9 @@ def moving_blocker_collision_time(
     for seed in seed_times:
         hit_time = seed
         for _ in range(10):
-            margin = margin_at(hit_time)
+            margin, derivative = margin_and_derivative_at(hit_time)
             if abs(margin) <= 1e-4:
                 break
-            derivative = derivative_at(hit_time)
             if abs(derivative) < 1e-6:
                 break
             next_time = hit_time - margin / derivative
@@ -430,6 +445,44 @@ def find_moving_intercept_newton(
     max_turn: int = 90,
 ) -> tuple[float, int, float] | None:
     speed = fleet_speed(ships)
+    initial = initial_by_id.get(target.id)
+    target_orbits = False
+    orbital_radius = 0.0
+    initial_angle = 0.0
+    if initial is not None and target.id not in comet_ids:
+        orbital_radius = math.hypot(initial[2] - CENTER, initial[3] - CENTER)
+        if orbital_radius + initial[4] < ROTATION_RADIUS_LIMIT:
+            target_orbits = True
+            initial_angle = math.atan2(initial[3] - CENTER, initial[2] - CENTER)
+
+    def margin_and_derivative_at(hit_time: float) -> tuple[float, float]:
+        if not target_orbits:
+            target_x = target.x
+            target_y = target.y
+            target_vx = target_vy = 0.0
+        else:
+            env_time = max(1, int(current_step)) + hit_time - 1
+            future_angle = initial_angle + angular_velocity * env_time
+            future_cos = math.cos(future_angle)
+            future_sin = math.sin(future_angle)
+            if hit_time <= 0.0:
+                target_x = target.x
+                target_y = target.y
+            else:
+                target_x = CENTER + orbital_radius * future_cos
+                target_y = CENTER + orbital_radius * future_sin
+            target_vx = -orbital_radius * angular_velocity * future_sin
+            target_vy = orbital_radius * angular_velocity * future_cos
+        dx = target_x - source.x
+        dy = target_y - source.y
+        distance = math.hypot(dx, dy)
+        distance_to_target_edge = distance - source.radius - 0.1 - target.radius
+        margin = distance_to_target_edge - speed * hit_time
+        if distance == 0:
+            return margin, -speed
+        distance_derivative = (dx * target_vx + dy * target_vy) / distance
+        return margin, distance_derivative - speed
+
     initial_distance = max(0.0, math.hypot(target.x - source.x, target.y - source.y) - source.radius - 0.1 - target.radius)
     estimated_time = max(0.25, initial_distance / speed)
     seed_times = []
@@ -441,10 +494,9 @@ def find_moving_intercept_newton(
     for seed in seed_times:
         hit_time = seed
         for _ in range(12):
-            margin = moving_intercept_margin(source, target, ships, hit_time, initial_by_id, angular_velocity, current_step, comet_ids)
+            margin, derivative = margin_and_derivative_at(hit_time)
             if abs(margin) <= 1e-4:
                 break
-            derivative = moving_intercept_margin_derivative(source, target, ships, hit_time, initial_by_id, angular_velocity, current_step, comet_ids)
             if abs(derivative) < 1e-6:
                 break
             next_time = hit_time - margin / derivative
@@ -1008,6 +1060,392 @@ def _segment_collision_progress(
     )
 
 
+def _fleet_cache_episode_signature(
+    player_id: int,
+    angular_velocity: float,
+    initial_planets: list[Any],
+) -> tuple[Any, ...]:
+    geometry = tuple(
+        sorted(
+            (
+                int(row[0]),
+                round(float(row[2]), 12),
+                round(float(row[3]), 12),
+                round(float(row[4]), 12),
+            )
+            for row in initial_planets
+        )
+    )
+    return int(player_id), round(float(angular_velocity), 12), geometry
+
+
+def _fleet_cache_fingerprint(fleet: Fleet) -> tuple[int, int, int, float]:
+    return (
+        int(fleet.owner),
+        int(fleet.from_planet_id),
+        int(fleet.ships),
+        round(float(fleet.angle), 12),
+    )
+
+
+def _prepare_fleet_hit_cache(
+    player_id: int,
+    angular_velocity: float,
+    initial_planets: list[Any],
+    step: int,
+    fleets: list[Fleet],
+) -> dict[str, int | bool]:
+    global _FLEET_HIT_CACHE_EPISODE_SIGNATURE, _FLEET_HIT_CACHE_LAST_STEP
+
+    episode_signature = _fleet_cache_episode_signature(
+        player_id,
+        angular_velocity,
+        initial_planets,
+    )
+    reset = (
+        _FLEET_HIT_CACHE_EPISODE_SIGNATURE != episode_signature
+        or (
+            _FLEET_HIT_CACHE_LAST_STEP is not None
+            and int(step) < int(_FLEET_HIT_CACHE_LAST_STEP)
+        )
+    )
+    if reset:
+        _FLEET_HIT_CACHE.clear()
+
+    active_ids = {int(fleet.id) for fleet in fleets}
+    stale_ids = [fleet_id for fleet_id in _FLEET_HIT_CACHE if fleet_id not in active_ids]
+    for fleet_id in stale_ids:
+        del _FLEET_HIT_CACHE[fleet_id]
+
+    _FLEET_HIT_CACHE_EPISODE_SIGNATURE = episode_signature
+    _FLEET_HIT_CACHE_LAST_STEP = int(step)
+    return {
+        "active": len(active_ids),
+        "reused": 0,
+        "computed": 0,
+        "removed": len(stale_ids),
+        "entries": len(_FLEET_HIT_CACHE),
+        "reset": reset,
+        "baseline_checks": 0,
+        "scheduled_checks": 0,
+        "static_rejected": 0,
+        "orbit_rejected": 0,
+        "fallback_checks": 0,
+    }
+
+
+def _ray_circle_interval(
+    start_x: float,
+    start_y: float,
+    velocity_x: float,
+    velocity_y: float,
+    center_x: float,
+    center_y: float,
+    radius: float,
+    max_time: float,
+) -> tuple[float, float] | None:
+    relative_x = start_x - center_x
+    relative_y = start_y - center_y
+    a = velocity_x * velocity_x + velocity_y * velocity_y
+    if a <= 0.0:
+        return None
+    b = 2.0 * (relative_x * velocity_x + relative_y * velocity_y)
+    c = relative_x * relative_x + relative_y * relative_y - radius * radius
+    discriminant = b * b - 4.0 * a * c
+    if discriminant < -COLLISION_FILTER_EPSILON:
+        return None
+    sqrt_discriminant = math.sqrt(max(0.0, discriminant))
+    first = (-b - sqrt_discriminant) / (2.0 * a)
+    second = (-b + sqrt_discriminant) / (2.0 * a)
+    interval_start = max(0.0, min(first, second))
+    interval_end = min(float(max_time), max(first, second))
+    if interval_end + COLLISION_FILTER_EPSILON < interval_start:
+        return None
+    return interval_start, interval_end
+
+
+def _candidate_turn_bounds(
+    interval_start: float,
+    interval_end: float,
+    horizon: int,
+    padding: int = 1,
+) -> tuple[int, int] | None:
+    first_turn = max(1, int(math.floor(interval_start)) - int(padding))
+    last_turn = min(int(horizon), int(math.ceil(interval_end)) + int(padding))
+    if last_turn < first_turn:
+        return None
+    return first_turn, last_turn
+
+
+def _fleet_search_horizon(
+    fleet: Fleet,
+    velocity_x: float,
+    velocity_y: float,
+    lookahead: int,
+) -> int:
+    speed = math.hypot(velocity_x, velocity_y)
+    if speed <= 0.0:
+        return 0
+    direction_x = velocity_x / speed
+    direction_y = velocity_y / speed
+    exit_time = board_exit_time(
+        float(fleet.x),
+        float(fleet.y),
+        direction_x,
+        direction_y,
+        speed,
+    )
+    if exit_time is None:
+        horizon = int(lookahead)
+    else:
+        horizon = min(
+            int(lookahead),
+            max(0, int(math.floor(float(exit_time) + COLLISION_FILTER_EPSILON))),
+        )
+
+    def endpoint_is_inside(turn: int) -> bool:
+        x = float(fleet.x) + velocity_x * int(turn)
+        y = float(fleet.y) + velocity_y * int(turn)
+        return 0.0 <= x <= BOARD_SIZE and 0.0 <= y <= BOARD_SIZE
+
+    while horizon > 0 and not endpoint_is_inside(horizon):
+        horizon -= 1
+    while horizon < int(lookahead) and endpoint_is_inside(horizon + 1):
+        horizon += 1
+    return horizon
+
+
+def _build_collision_filter_context(
+    target_planets: list[Planet],
+    initial_by_id: dict[int, Any],
+    angular_velocity: float,
+    step: int,
+    comet_ids: set[int],
+) -> dict[str, Any]:
+    motion_types = planet_motion_types(target_planets, initial_by_id, comet_ids)
+    orbit_metadata: dict[int, tuple[float, float]] = {}
+    for planet in target_planets:
+        if motion_types.get(int(planet.id)) != "orbiting":
+            continue
+        initial = initial_by_id.get(int(planet.id))
+        if initial is None:
+            continue
+        orbital_radius = math.hypot(float(initial[2]) - CENTER, float(initial[3]) - CENTER)
+        orbit_metadata[int(planet.id)] = (orbital_radius, float(planet.radius))
+    return {
+        "target_planets": target_planets,
+        "initial_by_id": initial_by_id,
+        "angular_velocity": float(angular_velocity),
+        "step": int(step),
+        "comet_ids": comet_ids,
+        "motion_types": motion_types,
+        "orbit_metadata": orbit_metadata,
+        "planet_segment_cache": {},
+    }
+
+
+def _planet_segment_for_turn(
+    planet: Planet,
+    turn: int,
+    filter_context: dict[str, Any],
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    cache_key = (int(planet.id), int(turn))
+    segment_cache = filter_context["planet_segment_cache"]
+    cached = segment_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    old_position = planet_position_after_moves(
+        planet,
+        max(0, int(turn) - 1),
+        filter_context["initial_by_id"],
+        filter_context["angular_velocity"],
+        filter_context["step"],
+        filter_context["comet_ids"],
+    )
+    new_position = planet_position_after_moves(
+        planet,
+        int(turn),
+        filter_context["initial_by_id"],
+        filter_context["angular_velocity"],
+        filter_context["step"],
+        filter_context["comet_ids"],
+    )
+    segment = (old_position, new_position)
+    segment_cache[cache_key] = segment
+    return segment
+
+
+def _schedule_planet_turns(
+    schedule: dict[int, list[Planet]],
+    planet: Planet,
+    first_turn: int,
+    last_turn: int,
+) -> int:
+    count = 0
+    for turn in range(int(first_turn), int(last_turn) + 1):
+        schedule.setdefault(turn, []).append(planet)
+        count += 1
+    return count
+
+
+def _fleet_future_hit_filtered(
+    fleet: Fleet,
+    target_planets: list[Planet],
+    initial_by_id: dict[int, Any],
+    angular_velocity: float,
+    step: int,
+    comet_ids: set[int],
+    lookahead: int,
+    deadline: float | None,
+    filter_context: dict[str, Any],
+    filter_stats: dict[str, int | bool],
+) -> tuple[int, int] | None:
+    speed = fleet_speed(fleet.ships, MAX_SPEED)
+    velocity_x = math.cos(fleet.angle) * speed
+    velocity_y = math.sin(fleet.angle) * speed
+    horizon = _fleet_search_horizon(fleet, velocity_x, velocity_y, lookahead)
+    if horizon <= 0:
+        return None
+
+    filter_stats["baseline_checks"] = int(filter_stats["baseline_checks"]) + (
+        int(horizon) * len(target_planets)
+    )
+    schedule: dict[int, list[Planet]] = {}
+    motion_types = filter_context["motion_types"]
+    orbit_metadata = filter_context["orbit_metadata"]
+    start_x = float(fleet.x)
+    start_y = float(fleet.y)
+
+    for planet in target_planets:
+        if deadline is not None and time.perf_counter() >= deadline:
+            return None
+        motion_type = motion_types.get(int(planet.id), "unknown")
+        if motion_type == "static":
+            interval = _ray_circle_interval(
+                start_x,
+                start_y,
+                velocity_x,
+                velocity_y,
+                float(planet.x),
+                float(planet.y),
+                float(planet.radius) + COLLISION_FILTER_EPSILON,
+                horizon,
+            )
+            if interval is None:
+                filter_stats["static_rejected"] = int(filter_stats["static_rejected"]) + 1
+                continue
+            turn_bounds = _candidate_turn_bounds(*interval, horizon, padding=1)
+            if turn_bounds is not None:
+                filter_stats["scheduled_checks"] = int(filter_stats["scheduled_checks"]) + (
+                    _schedule_planet_turns(schedule, planet, *turn_bounds)
+                )
+            continue
+
+        if motion_type == "orbiting" and int(planet.id) in orbit_metadata:
+            orbital_radius, planet_radius = orbit_metadata[int(planet.id)]
+            angular_step = min(math.pi, abs(float(angular_velocity)))
+            outer_radius = orbital_radius + planet_radius + COLLISION_FILTER_EPSILON
+            inner_radius = max(
+                0.0,
+                orbital_radius * math.cos(angular_step / 2.0)
+                - planet_radius
+                - COLLISION_FILTER_EPSILON,
+            )
+            outer_interval = _ray_circle_interval(
+                start_x,
+                start_y,
+                velocity_x,
+                velocity_y,
+                CENTER,
+                CENTER,
+                outer_radius,
+                horizon,
+            )
+            if outer_interval is None:
+                filter_stats["orbit_rejected"] = int(filter_stats["orbit_rejected"]) + 1
+                continue
+
+            inner_interval = None
+            if inner_radius > COLLISION_FILTER_EPSILON:
+                inner_interval = _ray_circle_interval(
+                    start_x,
+                    start_y,
+                    velocity_x,
+                    velocity_y,
+                    CENTER,
+                    CENTER,
+                    inner_radius,
+                    horizon,
+                )
+            turn_bounds = _candidate_turn_bounds(*outer_interval, horizon, padding=1)
+            if turn_bounds is None:
+                filter_stats["orbit_rejected"] = int(filter_stats["orbit_rejected"]) + 1
+                continue
+
+            first_turn, last_turn = turn_bounds
+            scheduled_for_planet = 0
+            for turn in range(first_turn, last_turn + 1):
+                if (
+                    inner_interval is not None
+                    and float(turn - 1) >= inner_interval[0] + COLLISION_FILTER_EPSILON
+                    and float(turn) <= inner_interval[1] - COLLISION_FILTER_EPSILON
+                ):
+                    continue
+                schedule.setdefault(turn, []).append(planet)
+                scheduled_for_planet += 1
+            if scheduled_for_planet == 0:
+                filter_stats["orbit_rejected"] = int(filter_stats["orbit_rejected"]) + 1
+            else:
+                filter_stats["scheduled_checks"] = int(filter_stats["scheduled_checks"]) + scheduled_for_planet
+            continue
+
+        filter_stats["fallback_checks"] = int(filter_stats["fallback_checks"]) + int(horizon)
+        filter_stats["scheduled_checks"] = int(filter_stats["scheduled_checks"]) + (
+            _schedule_planet_turns(schedule, planet, 1, horizon)
+        )
+
+    fleet_positions = [(start_x, start_y)]
+    for _turn in range(1, int(horizon) + 1):
+        old_x, old_y = fleet_positions[-1]
+        fleet_positions.append((old_x + velocity_x, old_y + velocity_y))
+
+    for turn in sorted(schedule):
+        if deadline is not None and time.perf_counter() >= deadline:
+            return None
+        fleet_start = fleet_positions[turn - 1]
+        fleet_end = fleet_positions[turn]
+        best_hit: tuple[float, int] | None = None
+        for planet in schedule[turn]:
+            if deadline is not None and time.perf_counter() >= deadline:
+                return None
+            target_start, target_end = _planet_segment_for_turn(
+                planet,
+                turn,
+                filter_context,
+            )
+            hit = (
+                _segment_to_segment_distance(
+                    fleet_start,
+                    fleet_end,
+                    target_start,
+                    target_end,
+                )
+                < planet.radius
+            )
+            if hit:
+                progress = _segment_collision_progress(
+                    fleet_start,
+                    fleet_end,
+                    target_start,
+                    target_end,
+                )
+                if best_hit is None or progress < best_hit[0]:
+                    best_hit = (progress, int(planet.id))
+        if best_hit is not None:
+            return best_hit[1], int(step) + int(turn)
+    return None
+
+
 def _fleet_future_hit(
     fleet: Fleet,
     target_planets: list[Planet],
@@ -1018,52 +1456,89 @@ def _fleet_future_hit(
     lookahead: int = FUTURE_SOURCE_LOOKAHEAD,
     deadline: float | None = None,
 ) -> tuple[int, int] | None:
-    speed = fleet_speed(fleet.ships, MAX_SPEED)
-    dx = math.cos(fleet.angle) * speed
-    dy = math.sin(fleet.angle) * speed
-    old_x = float(fleet.x)
-    old_y = float(fleet.y)
-    for turn in range(1, int(lookahead) + 1):
-        if deadline is not None and time.perf_counter() >= deadline:
+    filter_context = _build_collision_filter_context(
+        target_planets,
+        initial_by_id,
+        angular_velocity,
+        step,
+        comet_ids,
+    )
+    filter_stats: dict[str, int | bool] = {
+        "baseline_checks": 0,
+        "scheduled_checks": 0,
+        "static_rejected": 0,
+        "orbit_rejected": 0,
+        "fallback_checks": 0,
+    }
+    return _fleet_future_hit_filtered(
+        fleet,
+        target_planets,
+        initial_by_id,
+        angular_velocity,
+        step,
+        comet_ids,
+        lookahead,
+        deadline,
+        filter_context,
+        filter_stats,
+    )
+
+
+def _cached_fleet_future_hit(
+    fleet: Fleet,
+    target_planets: list[Planet],
+    initial_by_id: dict[int, Any],
+    angular_velocity: float,
+    step: int,
+    comet_ids: set[int],
+    lookahead: int,
+    deadline: float | None,
+    cache_stats: dict[str, int | bool],
+    valid_target_ids: set[int],
+    filter_context: dict[str, Any],
+) -> tuple[int, int] | None:
+    fleet_id = int(fleet.id)
+    fingerprint = _fleet_cache_fingerprint(fleet)
+    cached = _FLEET_HIT_CACHE.get(fleet_id)
+
+    if cached is not None:
+        cached_fingerprint, target_id, absolute_hit_step = cached
+        if (
+            cached_fingerprint == fingerprint
+            and int(absolute_hit_step) > int(step)
+            and int(target_id) in valid_target_ids
+        ):
+            cache_stats["reused"] = int(cache_stats["reused"]) + 1
+            if int(absolute_hit_step) - int(step) <= int(lookahead):
+                return int(target_id), int(absolute_hit_step)
             return None
-        new_x = old_x + dx
-        new_y = old_y + dy
-        if not (0.0 <= new_x <= 100.0 and 0.0 <= new_y <= 100.0):
-            break
+        del _FLEET_HIT_CACHE[fleet_id]
 
-        best_hit: tuple[float, int] | None = None
-        for planet in target_planets:
-            if deadline is not None and time.perf_counter() >= deadline:
-                return None
-            target_old = planet_position_after_moves(
-                planet,
-                max(0, turn - 1),
-                initial_by_id,
-                angular_velocity,
-                step,
-                comet_ids,
+    cache_stats["computed"] = int(cache_stats["computed"]) + 1
+    future_hit = _fleet_future_hit_filtered(
+        fleet,
+        target_planets,
+        initial_by_id,
+        angular_velocity,
+        step,
+        comet_ids,
+        lookahead,
+        deadline,
+        filter_context,
+        cache_stats,
+    )
+    if future_hit is not None:
+        target_id, absolute_hit_step = future_hit
+        if (
+            int(absolute_hit_step) > int(step)
+            and int(target_id) in valid_target_ids
+        ):
+            _FLEET_HIT_CACHE[fleet_id] = (
+                fingerprint,
+                int(target_id),
+                int(absolute_hit_step),
             )
-            target_new = planet_position_after_moves(
-                planet,
-                turn,
-                initial_by_id,
-                angular_velocity,
-                step,
-                comet_ids,
-            )
-            hit = _segment_to_segment_distance((old_x, old_y), (new_x, new_y), target_old, target_new) < planet.radius
-            if hit:
-                progress = _segment_collision_progress((old_x, old_y), (new_x, new_y), target_old, target_new)
-                if best_hit is None or progress < best_hit[0]:
-                    best_hit = (progress, int(planet.id))
-
-        if best_hit is not None:
-            return best_hit[1], step + turn
-
-        old_x = new_x
-        old_y = new_y
-
-    return None
+    return future_hit
 
 
 def _incoming_events_by_target(
@@ -1075,24 +1550,57 @@ def _incoming_events_by_target(
     comet_ids: set[int],
     lookahead: int = MAX_COLLISION_TURN,
     deadline: float | None = None,
+    cache_stats: dict[str, int | bool] | None = None,
 ) -> dict[int, dict[int, dict[int, int]]]:
     events_by_target: dict[int, dict[int, dict[int, int]]] = {}
     if not fleets or not target_planets:
         return events_by_target
 
+    valid_target_ids = {int(planet.id) for planet in target_planets}
+    filter_context = _build_collision_filter_context(
+        target_planets,
+        initial_by_id,
+        angular_velocity,
+        step,
+        comet_ids,
+    )
+    local_filter_stats: dict[str, int | bool] = {
+        "baseline_checks": 0,
+        "scheduled_checks": 0,
+        "static_rejected": 0,
+        "orbit_rejected": 0,
+        "fallback_checks": 0,
+    }
     for fleet in fleets:
         if deadline is not None and time.perf_counter() >= deadline:
             break
-        future_hit = _fleet_future_hit(
-            fleet,
-            target_planets,
-            initial_by_id,
-            angular_velocity,
-            step,
-            comet_ids,
-            lookahead=lookahead,
-            deadline=deadline,
-        )
+        if cache_stats is None:
+            future_hit = _fleet_future_hit_filtered(
+                fleet,
+                target_planets,
+                initial_by_id,
+                angular_velocity,
+                step,
+                comet_ids,
+                lookahead,
+                deadline,
+                filter_context,
+                local_filter_stats,
+            )
+        else:
+            future_hit = _cached_fleet_future_hit(
+                fleet,
+                target_planets,
+                initial_by_id,
+                angular_velocity,
+                step,
+                comet_ids,
+                lookahead,
+                deadline,
+                cache_stats,
+                valid_target_ids,
+                filter_context,
+            )
         if future_hit is None:
             continue
         target_id, hit_step = future_hit
@@ -1495,6 +2003,35 @@ def _minimum_reinforcement_ships_to_survive(
     return int(low), best_simulation
 
 
+def _reinforcement_arrival_floor_table(
+    target: Planet,
+    player_id: int,
+    lost_turn: int,
+    horizon_turns: int,
+    incoming_events_by_target: dict[int, dict[int, dict[int, int]]],
+) -> tuple[dict[int, int], dict[int, dict[str, Any]], dict[int, int]]:
+    exact_floors: dict[int, int] = {}
+    exact_details: dict[int, dict[str, Any]] = {}
+    for arrival_turn in range(1, int(lost_turn) + 1):
+        floor_ships, floor_details = _minimum_reinforcement_ships_to_survive(
+            target,
+            player_id,
+            arrival_turn,
+            horizon_turns,
+            incoming_events_by_target,
+        )
+        exact_floors[arrival_turn] = int(floor_ships)
+        exact_details[arrival_turn] = dict(floor_details)
+
+    suffix_minimums: dict[int, int] = {}
+    minimum_floor: int | None = None
+    for arrival_turn in range(int(lost_turn), 0, -1):
+        floor_ships = int(exact_floors[arrival_turn])
+        minimum_floor = floor_ships if minimum_floor is None else min(minimum_floor, floor_ships)
+        suffix_minimums[arrival_turn] = int(minimum_floor)
+    return exact_floors, exact_details, suffix_minimums
+
+
 def _simulate_source_after_launch(
     source: Planet,
     player_id: int,
@@ -1814,7 +2351,11 @@ def _hungarian_min_cost(costs: list[list[float]]) -> list[int]:
     return assignment
 
 
-def _choose_opening(obs: Any, include_debug: bool = False) -> tuple[list[list[Any]], dict[str, Any]]:
+def _choose_opening(
+    obs: Any,
+    include_debug: bool = False,
+    reinforcement_floor_pruning: bool = True,
+) -> tuple[list[list[Any]], dict[str, Any]]:
     try:
         remaining_overage_time = float(get(obs, "remainingOverageTime", 60.0) or 60.0)
     except (TypeError, ValueError):
@@ -1843,6 +2384,7 @@ def _choose_opening(obs: Any, include_debug: bool = False) -> tuple[list[list[An
         "selected": [],
         "time_budget_seconds": time_budget,
         "time_budget_exhausted": False,
+        "reinforcement_search": {},
     }
     if not my_planets:
         return [], debug
@@ -1859,6 +2401,13 @@ def _choose_opening(obs: Any, include_debug: bool = False) -> tuple[list[list[An
 
     motion_types = planet_motion_types(planets, initial_by_id, comet_ids)
     all_target_planets = [planet for planet in planets if planet.id not in comet_ids]
+    fleet_cache_stats = _prepare_fleet_hit_cache(
+        player_id,
+        angular_velocity,
+        raw_initial,
+        step,
+        fleets,
+    )
     incoming_events_by_target = _incoming_events_by_target(
         fleets,
         all_target_planets,
@@ -1868,6 +2417,15 @@ def _choose_opening(obs: Any, include_debug: bool = False) -> tuple[list[list[An
         comet_ids,
         lookahead=MAX_COLLISION_TURN,
         deadline=deadline,
+        cache_stats=fleet_cache_stats,
+    )
+    fleet_cache_stats["entries"] = len(_FLEET_HIT_CACHE)
+    debug["fleet_cache"] = dict(fleet_cache_stats)
+    print(
+        f"[fleet-cache] step={step} active={fleet_cache_stats['active']} "
+        f"reused={fleet_cache_stats['reused']} computed={fleet_cache_stats['computed']} "
+        f"entries={fleet_cache_stats['entries']} "
+        f"checks={fleet_cache_stats['scheduled_checks']}/{fleet_cache_stats['baseline_checks']}"
     )
     target_planets = [planet for planet in planets if planet.owner != player_id and planet.id not in comet_ids]
     future_sources_by_id = _future_sources_by_id(
@@ -1923,6 +2481,18 @@ def _choose_opening(obs: Any, include_debug: bool = False) -> tuple[list[list[An
     travel_cache: dict[tuple[int, int, int, int], tuple[float, float | None]] = {}
     target_floor_cache: dict[tuple[int, int, int], tuple[int, dict[str, Any]]] = {}
     source_safe_cache: dict[tuple[int, int, int], tuple[int, dict[str, Any]]] = {}
+    reinforcement_floor_cache: dict[
+        tuple[int, int, int],
+        tuple[dict[int, int], dict[int, dict[str, Any]], dict[int, int]],
+    ] = {}
+    reinforcement_search_stats: dict[str, int | bool] = {
+        "threats": 0,
+        "sources": 0,
+        "tested": 0,
+        "floor_skipped": 0,
+        "geometry_calls": 0,
+        "deadline_exhausted": False,
+    }
 
     def source_at_launch_step(source: Planet, reference_step: int, launch_step: int) -> Planet:
         moves_done = max(0, int(launch_step) - int(reference_step))
@@ -2010,11 +2580,30 @@ def _choose_opening(obs: Any, include_debug: bool = False) -> tuple[list[list[An
         source_safe_cache[cache_key] = (result[0], dict(result[1]))
         return result[0], dict(result[1])
 
+    def cached_reinforcement_floor_table(
+        target: Planet,
+        lost_turn: int,
+        horizon_turns: int,
+    ) -> tuple[dict[int, int], dict[int, dict[str, Any]], dict[int, int]]:
+        cache_key = (int(target.id), int(lost_turn), int(horizon_turns))
+        cached = reinforcement_floor_cache.get(cache_key)
+        if cached is None:
+            cached = _reinforcement_arrival_floor_table(
+                target,
+                player_id,
+                lost_turn,
+                horizon_turns,
+                incoming_events_by_target,
+            )
+            reinforcement_floor_cache[cache_key] = cached
+        return cached
+
     def evaluate_reinforcement_source(
         source: Planet,
         target: Planet,
         target_status: dict[str, Any],
     ) -> dict[str, Any] | None:
+        reinforcement_search_stats["sources"] = int(reinforcement_search_stats["sources"]) + 1
         lost_turn = target_status.get("lost_turn")
         if lost_turn is None:
             return None
@@ -2038,19 +2627,57 @@ def _choose_opening(obs: Any, include_debug: bool = False) -> tuple[list[list[An
         if max_planned_ships <= 0:
             return None
 
+        exact_floors: dict[int, int] = {}
+        exact_floor_details: dict[int, dict[str, Any]] = {}
+        suffix_minimums: dict[int, int] = {}
+        if reinforcement_floor_pruning:
+            exact_floors, exact_floor_details, suffix_minimums = cached_reinforcement_floor_table(
+                target,
+                lost_turn,
+                horizon_turns,
+            )
+
         planned_ships = 1
+        if reinforcement_floor_pruning:
+            planned_ships = max(1, int(suffix_minimums.get(1, 1)))
+            reinforcement_search_stats["floor_skipped"] = (
+                int(reinforcement_search_stats["floor_skipped"]) + planned_ships - 1
+            )
+
         while planned_ships <= max_planned_ships:
             if time.perf_counter() >= deadline:
                 debug["time_budget_exhausted"] = True
+                reinforcement_search_stats["deadline_exhausted"] = True
                 return None
 
+            reinforcement_search_stats["tested"] = int(reinforcement_search_stats["tested"]) + 1
             wait_turns = _wait_turns_to_leave_one(source, planned_ships)
             if wait_turns >= lost_turn:
                 planned_ships += 1
                 continue
 
+            if reinforcement_floor_pruning:
+                earliest_arrival = int(wait_turns) + 1
+                lower_bound = int(suffix_minimums.get(earliest_arrival, 1))
+                if planned_ships < lower_bound:
+                    reinforcement_search_stats["floor_skipped"] = (
+                        int(reinforcement_search_stats["floor_skipped"]) + lower_bound - planned_ships
+                    )
+                    planned_ships = lower_bound
+                    continue
+
             launch_step = step + wait_turns
             launch_source = source_at_launch_step(source, step, launch_step)
+            travel_cache_key = (
+                int(launch_source.id),
+                int(target.id),
+                int(planned_ships),
+                int(launch_step),
+            )
+            if travel_cache_key not in travel_cache:
+                reinforcement_search_stats["geometry_calls"] = (
+                    int(reinforcement_search_stats["geometry_calls"]) + 1
+                )
             travel_turns, angle = cached_travel_turns(
                 launch_source,
                 target,
@@ -2066,16 +2693,24 @@ def _choose_opening(obs: Any, include_debug: bool = False) -> tuple[list[list[An
                 planned_ships += 1
                 continue
 
-            floor_ships, floor_details = _minimum_reinforcement_ships_to_survive(
-                target,
-                player_id,
-                arrival_turns,
-                horizon_turns,
-                incoming_events_by_target,
-            )
+            if reinforcement_floor_pruning:
+                floor_ships = int(exact_floors[arrival_turns])
+                floor_details = dict(exact_floor_details[arrival_turns])
+            else:
+                floor_ships, floor_details = _minimum_reinforcement_ships_to_survive(
+                    target,
+                    player_id,
+                    arrival_turns,
+                    horizon_turns,
+                    incoming_events_by_target,
+                )
             if floor_ships <= 0:
                 return None
             if planned_ships < floor_ships:
+                reinforcement_search_stats["floor_skipped"] = (
+                    int(reinforcement_search_stats["floor_skipped"])
+                    + max(0, int(floor_ships) - int(planned_ships) - 1)
+                )
                 planned_ships = max(planned_ships + 1, int(floor_ships))
                 continue
 
@@ -2160,6 +2795,7 @@ def _choose_opening(obs: Any, include_debug: bool = False) -> tuple[list[list[An
         if bool(target_status["needs_reinforcement"]):
             owned_threats.append((target, target_status))
 
+    reinforcement_search_stats["threats"] = len(owned_threats)
     owned_threats.sort(
         key=lambda item: (
             int(item[1]["lost_turn"]),
@@ -2170,6 +2806,7 @@ def _choose_opening(obs: Any, include_debug: bool = False) -> tuple[list[list[An
     for target, target_status in owned_threats:
         if time.perf_counter() >= deadline:
             debug["time_budget_exhausted"] = True
+            reinforcement_search_stats["deadline_exhausted"] = True
             break
         defense_sources = [
             source
@@ -2216,6 +2853,14 @@ def _choose_opening(obs: Any, include_debug: bool = False) -> tuple[list[list[An
             debug["selected"].append(selected)
 
     debug["reinforcements"] = reinforcement_rows
+    debug["reinforcement_search"] = dict(reinforcement_search_stats)
+    print(
+        f"[reinforcement-search] threats={reinforcement_search_stats['threats']} "
+        f"sources={reinforcement_search_stats['sources']} "
+        f"tested={reinforcement_search_stats['tested']} "
+        f"floor_skipped={reinforcement_search_stats['floor_skipped']} "
+        f"geometry_calls={reinforcement_search_stats['geometry_calls']}"
+    )
     capture_sources = [
         source
         for source in sources

@@ -6,7 +6,7 @@ venv/
 ENV/
 env.bak/
 venv.bak/
-
+__init__.py
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -20,7 +20,7 @@ __pycache__/
 .vscode/
 *.swp
 *.swo
-
+tests/
 # Data & Notebooks
 data/
 *.parquet
