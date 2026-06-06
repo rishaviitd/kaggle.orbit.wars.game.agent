@@ -4,9 +4,15 @@ from typing import Any
 
 import numpy as np
 
+from imitate.features.formula.numba_kernels import (
+    formula_kernel,
+    is_numba_available,
+)
+
 BOARD_CENTER = 50.0
 ROTATION_RADIUS_LIMIT = 50.0
 MAX_FLEET_SPEED = 6.0
+USE_NUMBA_FORMULA_KERNEL = is_numba_available()
 
 GLOBAL_FORMULA_FEATURES = (
     "remaining_steps",
@@ -119,113 +125,162 @@ def extract_formula_features(
     fleet_source_owners = context["fleet_source_owners"]
     fleet_source_present = context["fleet_source_present"]
 
-    current_step = float(metadata["step"])
-    remaining_steps = max(float(episode_steps) - current_step, 0.0)
-    game_progress = np.clip(current_step / max(1.0, float(episode_steps)), 0.0, 1.0)
-    friendly_stationed = np.sum(np.where(planet_owners == player_id, planet_ships, 0.0))
-    enemy_stationed = np.sum(
-        np.where((planet_owners != player_id) & (planet_owners != -1), planet_ships, 0.0)
-    )
-    friendly_fleets = np.sum(np.where(fleet_owners == player_id, fleet_ships, 0.0))
-    enemy_fleets = np.sum(
-        np.where((fleet_owners != player_id) & (fleet_owners != -1), fleet_ships, 0.0)
-    )
-    global_values = np.asarray(
+    if USE_NUMBA_FORMULA_KERNEL:
+        comet_path_indices = np.asarray(direct["values"]["comet"], dtype=np.float32)[:, 0]
+        comet_path_lengths = context["comet_path_lengths"].astype(np.float32, copy=False)
         (
-            remaining_steps,
-            game_progress,
-            friendly_stationed + friendly_fleets,
-            enemy_stationed + enemy_fleets,
-        ),
-        dtype=np.float32,
-    )
-
-    is_static, is_orbiting, is_comet = _planet_motion_flags(
-        planet_ids,
-        context["initial_planets"],
-        context["comet_planet_ids"],
-    )
-    planet_values = np.stack(
-        (
-            planet_owners == player_id,
-            planet_owners == -1,
-            (planet_owners != player_id) & (planet_owners != -1),
-            is_static,
-            is_orbiting,
-            is_comet,
-        ),
-        axis=1,
-    ).astype(np.float32)
-
-    fleet_values = np.stack(
-        (
-            _fleet_speed(fleet_ships),
-            np.sin(fleet_angles),
-            np.cos(fleet_angles),
-            fleet_owners == player_id,
-            fleet_owners != player_id,
-            fleet_source_present & (fleet_source_owners == player_id),
-            fleet_source_present & (fleet_source_owners == -1),
-            fleet_source_present
-            & (fleet_source_owners != player_id)
-            & (fleet_source_owners != -1),
-        ),
-        axis=1,
-    ).astype(np.float32)
-
-    source_owner = planet_owners[:, None]
-    target_owner = planet_owners[None, :]
-    source_ships = planet_ships[:, None]
-    target_ships = planet_ships[None, :]
-    source_production = planet_production[:, None]
-    target_production = planet_production[None, :]
-    source_quadrant_x = planet_positions[:, 0, None] >= BOARD_CENTER
-    source_quadrant_y = planet_positions[:, 1, None] >= BOARD_CENTER
-    target_quadrant_x = planet_positions[None, :, 0] >= BOARD_CENTER
-    target_quadrant_y = planet_positions[None, :, 1] >= BOARD_CENTER
-    planet_pair_values = np.stack(
-        (
-            source_owner == target_owner,
-            (source_owner == player_id) & (target_owner == player_id),
-            (source_owner == player_id) & (target_owner == -1),
-            (source_owner == player_id)
-            & (target_owner != player_id)
-            & (target_owner != -1),
-            (source_quadrant_x == target_quadrant_x)
-            & (source_quadrant_y == target_quadrant_y),
-            np.broadcast_to(
-                target_production - source_production,
-                (planet_ids.shape[0], planet_ids.shape[0]),
+            global_values,
+            planet_values,
+            fleet_values,
+            planet_pair_values,
+            fleet_planet_values,
+            comet_values,
+        ) = formula_kernel(
+            int(metadata["step"]),
+            int(episode_steps),
+            player_id,
+            planet_ids.astype(np.int32, copy=False),
+            planet_owners.astype(np.int32, copy=False),
+            planet_positions.astype(np.float32, copy=False),
+            planet_ships.astype(np.float32, copy=False),
+            planet_production.astype(np.float32, copy=False),
+            context["initial_planets"].astype(np.float32, copy=False),
+            context["comet_planet_ids"].astype(np.int32, copy=False),
+            fleet_owners.astype(np.int32, copy=False),
+            fleet_angles.astype(np.float32, copy=False),
+            fleet_ships.astype(np.float32, copy=False),
+            fleet_source_ids.astype(np.int32, copy=False),
+            fleet_source_owners.astype(np.int32, copy=False),
+            fleet_source_present.astype(np.bool_, copy=False),
+            comet_path_indices,
+            comet_path_lengths,
+        )
+        if fleet_values.shape[0] > 0:
+            fleet_values[:, 0] = _fleet_speed(fleet_ships)
+            fleet_values[:, 1] = np.sin(fleet_angles)
+            fleet_values[:, 2] = np.cos(fleet_angles)
+    else:
+        current_step = float(metadata["step"])
+        remaining_steps = max(float(episode_steps) - current_step, 0.0)
+        game_progress = np.clip(
+            current_step / max(1.0, float(episode_steps)),
+            0.0,
+            1.0,
+        )
+        friendly_stationed = np.sum(
+            np.where(planet_owners == player_id, planet_ships, 0.0)
+        )
+        enemy_stationed = np.sum(
+            np.where(
+                (planet_owners != player_id) & (planet_owners != -1),
+                planet_ships,
+                0.0,
+            )
+        )
+        friendly_fleets = np.sum(np.where(fleet_owners == player_id, fleet_ships, 0.0))
+        enemy_fleets = np.sum(
+            np.where(
+                (fleet_owners != player_id) & (fleet_owners != -1),
+                fleet_ships,
+                0.0,
+            )
+        )
+        global_values = np.asarray(
+            (
+                remaining_steps,
+                game_progress,
+                friendly_stationed + friendly_fleets,
+                enemy_stationed + enemy_fleets,
             ),
-            np.broadcast_to(
-                source_ships - target_ships,
-                (planet_ids.shape[0], planet_ids.shape[0]),
-            ),
-            np.broadcast_to(
-                source_ships / np.maximum(target_ships, 1.0),
-                (planet_ids.shape[0], planet_ids.shape[0]),
-            ),
-        ),
-        axis=2,
-    ).astype(np.float32)
+            dtype=np.float32,
+        )
 
-    fleet_owner_matrix = fleet_owners[:, None]
-    planet_owner_matrix = planet_owners[None, :]
-    fleet_planet_values = np.stack(
-        (
-            fleet_owner_matrix == planet_owner_matrix,
-            fleet_source_ids[:, None] == planet_ids[None, :],
-            fleet_owner_matrix == planet_owner_matrix,
-            fleet_owner_matrix != planet_owner_matrix,
-        ),
-        axis=2,
-    ).astype(np.float32)
+        is_static, is_orbiting, is_comet = _planet_motion_flags(
+            planet_ids,
+            context["initial_planets"],
+            context["comet_planet_ids"],
+        )
+        planet_values = np.stack(
+            (
+                planet_owners == player_id,
+                planet_owners == -1,
+                (planet_owners != player_id) & (planet_owners != -1),
+                is_static,
+                is_orbiting,
+                is_comet,
+            ),
+            axis=1,
+        ).astype(np.float32)
 
-    comet_path_indices = np.asarray(direct["values"]["comet"])[:, 0]
-    comet_path_lengths = context["comet_path_lengths"].astype(np.float32)
-    comet_values = (
-        comet_path_indices / np.maximum(comet_path_lengths, 1.0)
-    ).reshape(-1, 1).astype(np.float32)
+        fleet_values = np.stack(
+            (
+                _fleet_speed(fleet_ships),
+                np.sin(fleet_angles),
+                np.cos(fleet_angles),
+                fleet_owners == player_id,
+                fleet_owners != player_id,
+                fleet_source_present & (fleet_source_owners == player_id),
+                fleet_source_present & (fleet_source_owners == -1),
+                fleet_source_present
+                & (fleet_source_owners != player_id)
+                & (fleet_source_owners != -1),
+            ),
+            axis=1,
+        ).astype(np.float32)
+
+        source_owner = planet_owners[:, None]
+        target_owner = planet_owners[None, :]
+        source_ships = planet_ships[:, None]
+        target_ships = planet_ships[None, :]
+        source_production = planet_production[:, None]
+        target_production = planet_production[None, :]
+        source_quadrant_x = planet_positions[:, 0, None] >= BOARD_CENTER
+        source_quadrant_y = planet_positions[:, 1, None] >= BOARD_CENTER
+        target_quadrant_x = planet_positions[None, :, 0] >= BOARD_CENTER
+        target_quadrant_y = planet_positions[None, :, 1] >= BOARD_CENTER
+        planet_pair_values = np.stack(
+            (
+                source_owner == target_owner,
+                (source_owner == player_id) & (target_owner == player_id),
+                (source_owner == player_id) & (target_owner == -1),
+                (source_owner == player_id)
+                & (target_owner != player_id)
+                & (target_owner != -1),
+                (source_quadrant_x == target_quadrant_x)
+                & (source_quadrant_y == target_quadrant_y),
+                np.broadcast_to(
+                    target_production - source_production,
+                    (planet_ids.shape[0], planet_ids.shape[0]),
+                ),
+                np.broadcast_to(
+                    source_ships - target_ships,
+                    (planet_ids.shape[0], planet_ids.shape[0]),
+                ),
+                np.broadcast_to(
+                    source_ships / np.maximum(target_ships, 1.0),
+                    (planet_ids.shape[0], planet_ids.shape[0]),
+                ),
+            ),
+            axis=2,
+        ).astype(np.float32)
+
+        fleet_owner_matrix = fleet_owners[:, None]
+        planet_owner_matrix = planet_owners[None, :]
+        fleet_planet_values = np.stack(
+            (
+                fleet_owner_matrix == planet_owner_matrix,
+                fleet_source_ids[:, None] == planet_ids[None, :],
+                fleet_owner_matrix == planet_owner_matrix,
+                fleet_owner_matrix != planet_owner_matrix,
+            ),
+            axis=2,
+        ).astype(np.float32)
+
+        comet_path_indices = np.asarray(direct["values"]["comet"])[:, 0]
+        comet_path_lengths = context["comet_path_lengths"].astype(np.float32)
+        comet_values = (
+            comet_path_indices / np.maximum(comet_path_lengths, 1.0)
+        ).reshape(-1, 1).astype(np.float32)
 
     return {
         "feature_names": {

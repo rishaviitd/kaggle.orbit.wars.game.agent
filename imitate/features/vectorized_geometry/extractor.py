@@ -4,7 +4,13 @@ from typing import Any
 
 import numpy as np
 
+from imitate.features.vectorized_geometry.numba_kernels import (
+    geometry_kernel,
+    is_numba_available,
+)
+
 BOARD_CENTER = 50.0
+USE_NUMBA_GEOMETRY_KERNEL = is_numba_available()
 
 PLANET_GEOMETRY_FEATURES = (
     "orbital_radius",
@@ -463,18 +469,46 @@ def extract_vectorized_geometry_features(
 ) -> dict[str, Any]:
     """Compute current-snapshot spatial features with NumPy broadcasting."""
     planet_velocity, comet_velocity, comet_valid = _planet_velocities(direct, formula)
-    planet_pair_values, planet_pair_masks, planet_pair_distance = (
-        _planet_pair_geometry(direct, planet_velocity)
-    )
-    fleet_planet_values, fleet_planet_masks, fleet_planet_distance, fleet_velocity = (
-        _fleet_planet_geometry(direct, formula, planet_velocity)
-    )
-    planet_values, planet_masks = _planet_geometry(direct, planet_pair_distance)
-    fleet_values, fleet_masks = _fleet_geometry(
-        direct,
-        fleet_velocity,
-        fleet_planet_distance,
-    )
+    if USE_NUMBA_GEOMETRY_KERNEL:
+        fleet_formula = np.asarray(formula["values"]["fleet"])
+        (
+            planet_values,
+            planet_masks,
+            fleet_values,
+            fleet_masks,
+            planet_pair_values,
+            planet_pair_masks,
+            fleet_planet_values,
+            fleet_planet_masks,
+        ) = geometry_kernel(
+            direct["context"]["planet_positions"].astype(np.float32, copy=False),
+            direct["context"]["planet_radii"].astype(np.float32, copy=False),
+            direct["context"]["planet_owners"].astype(np.int32, copy=False),
+            direct["metadata"]["planet_ids"].astype(np.int32, copy=False),
+            int(direct["metadata"]["player_id"]),
+            planet_velocity.astype(np.float32, copy=False),
+            np.asarray(direct["values"]["fleet"], dtype=np.float32)[:, :2],
+            direct["metadata"]["fleet_source_planet_ids"].astype(np.int32, copy=False),
+            fleet_formula[:, 0].astype(np.float32, copy=False),
+            fleet_formula[:, 1].astype(np.float32, copy=False),
+            fleet_formula[:, 2].astype(np.float32, copy=False),
+        )
+    else:
+        planet_pair_values, planet_pair_masks, planet_pair_distance = (
+            _planet_pair_geometry(direct, planet_velocity)
+        )
+        (
+            fleet_planet_values,
+            fleet_planet_masks,
+            fleet_planet_distance,
+            fleet_velocity,
+        ) = _fleet_planet_geometry(direct, formula, planet_velocity)
+        planet_values, planet_masks = _planet_geometry(direct, planet_pair_distance)
+        fleet_values, fleet_masks = _fleet_geometry(
+            direct,
+            fleet_velocity,
+            fleet_planet_distance,
+        )
     comet_values = np.column_stack(
         (
             comet_velocity[:, 0],
