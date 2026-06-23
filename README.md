@@ -1,4 +1,95 @@
-# Orbit Wars
+<p align="center">
+  <a href="https://www.kaggle.com/competitions/orbit-wars">
+    <img src="https://www.googleapis.com/download/storage/v1/b/kaggle-user-content/o/inbox%2F50767%2Fc09b79f4c324a1ad32dad0ef02df5918%2Forbit-wars-large-slow.gif?generation=1776359797519487&amp;alt=media" alt="Orbit Wars gameplay" width="100%" />
+  </a>
+</p>
+
+<h1 align="center">Orbit Wars</h1>
+
+<p align="center">
+  <strong>1100+ ELO Kaggle Orbit Wars agent</strong><br />
+  A replay-trained, GPU-ready strategy agent for continuous-space real-time strategy.
+</p>
+
+<p align="center">
+  <a href="https://www.kaggle.com/competitions/orbit-wars">Competition</a>
+  &nbsp;&middot;&nbsp;
+  <a href="notebooks/rl_ppo.ipynb">PPO notebook</a>
+  &nbsp;&middot;&nbsp;
+  <a href="agents/main.py">Agent</a>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Performance-1100%2B%20ELO-1f7a5a?style=for-the-badge" alt="1100+ ELO" />
+  <img src="https://img.shields.io/badge/PyTorch-GPU%20ready-ee4c2c?style=for-the-badge&logo=pytorch&logoColor=white" alt="PyTorch GPU ready" />
+  <img src="https://img.shields.io/badge/Numba-Accelerated-00a3e0?style=for-the-badge" alt="Numba accelerated" />
+</p>
+
+## Built With
+
+| Area | Stack used in this repository |
+| --- | --- |
+| Learning | Behavior cloning from high-quality replays, reinforcement learning, and Proximal Policy Optimization (PPO) self-play |
+| Deep learning | PyTorch policy/value models and entity-oriented feature representations |
+| Parallel execution | Batched PyTorch tensor planning on CUDA-capable devices; parallel PPO environments; multiprocessing replay-feature extraction |
+| Performance | Numba-compiled physics, formula, and vectorized-geometry kernels |
+| Data | Kaggle replay JSON, Parquet, PyArrow, Pandas, Polars, NumPy, and ORJSON |
+| Environment | Kaggle Environments, Python 3.11+, and UV |
+
+## Project Highlights
+
+- **1100+ ELO agent** built for the Kaggle Orbit Wars competition.
+- **Replay-to-policy workflow**: collect leader-board replays, extract entity and physics features, then train imitation and RL policies.
+- **PPO self-play**: the training notebook collects rollouts from multiple environments in parallel and periodically synchronizes its self-play opponent.
+- **GPU-ready planning**: the deployed agent uses PyTorch tensors and keeps computations device-consistent across CPU and CUDA.
+- **Physics-aware decisions**: orbit prediction, comet paths, fleet intercepts, collision checks, capture sizing, and reinforcement timing inform each launch.
+- **Visual strategy gym**: run seeded games in a browser to inspect decisions, replay turns, and pressure-test strategies before submitting.
+
+## Repository Map
+
+| Path | Purpose |
+| --- | --- |
+| [`agents/main.py`](agents/main.py) | Main Torch-based competition agent |
+| [`agents/orbit_lite/`](agents/orbit_lite/) | Compact tensor planner and Kaggle adapter |
+| [`imitate/`](imitate/) | Replay feature extraction for behavior cloning |
+| [`notebooks/rl_ppo.ipynb`](notebooks/rl_ppo.ipynb) | PPO self-play training and evaluation workflow |
+| [`gym.py`](gym.py) | Browser-based visual strategy gym for AI-vs-AI experiments and AI-vs-human gameplay |
+| [`data/`](data/) | Downloaded leaderboard snapshots and replay data |
+
+## Quick Start
+
+```bash
+uv sync
+uv run python -m imitate.features.feature_engine \
+  --input data/batch/batch-1.parquet \
+  --workers auto
+```
+
+Feature extraction prints progress as it streams Parquet batches, uses multiprocessing for independent snapshots, and uses the available Numba kernels automatically.
+
+For PPO training, open [`notebooks/rl_ppo.ipynb`](notebooks/rl_ppo.ipynb) in Kaggle or Jupyter. Set the notebook device to `cuda` when a GPU is available; the public configuration starts with multiple parallel environments and can be scaled for longer runs.
+
+## Visual Strategy Gym
+
+[`gym.py`](gym.py) is the practical testing ground for strategy work. It runs the game in a local browser UI, making it easy to validate a plan before it reaches a competition submission.
+
+<p align="center">
+  <img src="assets/gym_screenshot.png" alt="Orbit Wars visual strategy gym showing the game board, fleet trajectories, and decision insights" width="100%" />
+</p>
+
+- **AI vs AI**: compare agents or strategy variants under the same seed and watch how their openings, reinforcements, captures, and endgames diverge.
+- **AI vs human**: play directly against a local agent, choose your seat, aim launches on the board, and inspect the agent's decisions turn by turn.
+- **Visual debugging**: review live board state, candidate and opening analysis, movement paths, turn history, deterministic seeds, and saved local game episodes.
+
+```bash
+uv run python gym.py --agent v0 --seed 20260507
+```
+
+The server prints the local URL as it starts and reloads automatically when the game or agent code changes. Use `--seat second` to play from the other starting position, or pass `--agent path/to/agent.py` to test a different local agent.
+
+---
+
+## Game Reference
 
 Conquer planets rotating around a sun in continuous 2D space. A real-time strategy game for 2 or 4 players.
 
@@ -172,49 +263,10 @@ def agent(obs):
 | `boardSize`    | 100.0   | Board dimensions         |
 | `cometSpeed`   | 4.0     | Comet speed (units/turn) |
 
-The Kaggle Orbit Wars competition is actively running until June 2026. Because the competition is still underway, there is no single "final winning solution" yet. [1, 2]
-However, top-tier competitors currently dominating the leaderboard (such as Jake Will and TonyK) and the community's active research threads have shared the exact architectures and technical strategies driving the highest-ranking bots: [3, 4]
+## Implementation Notes
 
-## 1. Environment Rewriting for Speed (The JAX/Numba Route)
+The training path begins with replay data: high-quality games are stored as JSON and compacted into Parquet snapshots. The feature engine derives direct state, formulas, player-relative views, aggregates, vectorized geometry, and physics features. Its independent snapshots are distributed across worker processes, while Numba accelerates the computationally dense kernels.
 
-A major bottleneck in training an agent for a complex, 500-turn 2D space simulation is execution speed. Top players noted that using the raw Python environment provided by Kaggle is far too slow for deep reinforcement learning. [1, 3]
+The PPO notebook uses self-play with an MLP policy/value network. Each owned planet is treated as a decision point, with candidate targets represented as structured features. The agent learns target selection while the environment rules determine valid fleet launches and movement.
 
-- The Solution: Competitors rewrote the backend physics and simulation environment in JAX or Numba to enable massive parallelization.
-- The Impact: This pushed simulation speeds up to ~10,000 Steps Per Second (SPS), making sample-heavy reinforcement learning feasible. [3]
-
-## 2. Neural Network Architecture: Entity Transformers
-
-Because the board state scales dynamically (the number of active planets, flying comets, and traveling fleets changes every single turn), standard feed-forward networks fail. [2]
-
-- The Solution: Leading agents use an Entity Transformer model.
-- How it works: The transformer treats every planet and fleet as an independent "token." This allows the network to process an arbitrary number of objects on the board seamlessly, dynamically calculating relationships and spatial threats between them regardless of how many units are alive. [3]
-
-## 3. Algorithm & Policy Optimization (PPO & REINFORCE)
-
-Pure heuristics (like a simple "nearest planet sniper" bot) max out early on the leaderboard. Top players rely on Proximal Policy Optimization (PPO) or REINFORCE with custom modifications: [2, 5]
-
-- No Discount Factor: Because games have a fixed terminal boundary of exactly 500 steps, top solutions do not use a discount factor (γ = 1.0). Applying standard discounting shrinks the endgame reward signal so much that the agent struggles to value long-term planetary conquest. [6, 7]
-- Adaptive Entropy Scaling: To prevent the policy from collapsing and becoming overconfident in narrow, predictable strategies, developers use a proportional entropy penalty. If entropy drops too low, they scale up the exploration bonus aggressively to keep the agent searching for creative maneuvers. [7]
-
-## 4. Advanced Geometric Feature Engineering [8]
-
-While deep learning can theoretically learn everything from scratch, players lack the massive compute scale of companies like OpenAI. [3]
-
-- The Solution: Top bots inject strong inductive biases (pre-calculated geometry math) directly into the model inputs. This includes swept-pair collision checking (quadratic equations predicting exactly if and when a fleet's straight line will intersect a planet's moving orbital path during a tick) and precise travel-time vectors to future planet positions. [3, 9, 10]
-
-## 5. Training Strategy: Data Mining Top Replays
-
-To fast-track training, the community utilizes the Orbit Wars top-10% daily episode replay datasets. Competitors download the JSON files of the highest-rated matchups from the live leaderboard to kickstart their agents via Imitation Learning (Behavioral Cloning) before turning on Self-Play. [11]
-Are you planning to build an agent using deep reinforcement learning (like PyTorch or JAX), or are you trying to write a high-performance geometric heuristic bot? I can give you code templates for either approach!
-
-[1] [https://www.kaggle.com](https://www.kaggle.com/competitions/orbit-wars)
-[2] [https://www.kaggle.com](https://www.kaggle.com/competitions/orbit-wars)
-[3] [https://www.kaggle.com](https://www.kaggle.com/competitions/orbit-wars/discussion/697725)
-[4] [https://www.kaggle.com](https://www.kaggle.com/competitions/orbit-wars/leaderboard)
-[5] [https://www.kaggle.com](https://www.kaggle.com/competitions/orbit-wars/discussion/693755)
-[6] [https://www.kaggle.com](https://www.kaggle.com/competitions/orbit-wars/discussion/693020)
-[7] [https://www.kaggle.com](https://www.kaggle.com/competitions/orbit-wars/discussion/693020)
-[8] [https://www.kaggle.com](https://www.kaggle.com/competitions/orbit-wars/discussion/697725)
-[9] [https://www.kaggle.com](https://www.kaggle.com/competitions/orbit-wars)
-[10] [https://www.kaggle.com](https://www.kaggle.com/competitions/orbit-wars/discussion/696043)
-[11] [https://www.kaggle.com](https://www.kaggle.com/competitions/orbit-wars/discussion/697413)
+At inference time, the competition agent emphasizes deterministic, physics-aware planning: it evaluates capture costs, moving targets, comet timing, reinforcements, and future garrison states before emitting legal moves.
